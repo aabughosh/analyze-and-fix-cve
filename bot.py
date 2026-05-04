@@ -700,6 +700,28 @@ def create_pr(repo_dir: str, ticket: CVETicket, package: str,
         log.info("[DRY RUN] Would push branch %s and create PR", branch_name)
         return f"[DRY RUN] PR would be created on branch {branch_name}"
 
+    repo_owner = repo_url.replace("https://github.com/", "").split("/")[0] if repo_url else ""
+    gh_user_result = _run(["gh", "api", "user", "-q", ".login"], cwd=repo_dir, check=False)
+    gh_user = gh_user_result.stdout.strip() if gh_user_result.returncode == 0 else ""
+    is_fork_needed = gh_user and repo_owner and gh_user.lower() != repo_owner.lower()
+
+    if is_fork_needed:
+        log.info("No push access to %s, forking to %s", repo_owner, gh_user)
+        fork_result = _run(["gh", "repo", "fork", repo_url.replace("https://github.com/", ""),
+                            "--clone=false", "--remote=false"], cwd=repo_dir, check=False)
+        if fork_result.returncode != 0:
+            log.info("Fork may already exist, continuing: %s", fork_result.stderr[:200])
+
+        repo_name = repo_url.replace("https://github.com/", "").split("/")[-1]
+        fork_url = f"https://github.com/{gh_user}/{repo_name}"
+        gh_token = os.environ.get("GITHUB_TOKEN", "")
+        if gh_token:
+            auth_fork_url = fork_url.replace("https://github.com/", f"https://x-access-token:{gh_token}@github.com/")
+        else:
+            auth_fork_url = fork_url
+        _run(["git", "remote", "set-url", "origin", auth_fork_url], cwd=repo_dir, check=False)
+        log.info("Set push remote to fork: %s", fork_url)
+
     push_result = _run(["git", "push", "--force", "origin", branch_name], cwd=repo_dir, check=False)
     if push_result.returncode != 0:
         log.error("git push failed: %s", push_result.stderr)
@@ -724,12 +746,18 @@ def create_pr(repo_dir: str, ticket: CVETicket, package: str,
 - https://www.cve.org/CVERecord?id={ticket.cve_id}
 """
 
+    target_repo = repo_url.replace("https://github.com/", "") if repo_url else ""
+    if is_fork_needed:
+        head_ref = f"{gh_user}:{branch_name}"
+    else:
+        head_ref = branch_name
+
     result = _run(
         ["gh", "pr", "create",
-         "--head", branch_name,
+         "--head", head_ref,
          "--title", msg,
          "--body", pr_body,
-         "--repo", repo_url.replace("https://github.com/", "") if repo_url else ""],
+         "--repo", target_repo],
         cwd=repo_dir,
         check=False,
     )
