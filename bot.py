@@ -581,6 +581,65 @@ def _store_details(repo_dir: str, details: DetailedAnalysis) -> None:
         pass
 
 
+def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str) -> str:
+    """Look up the fixed version for a CVE from multiple sources.
+
+    Tries in order:
+    1. govulncheck output (most reliable)
+    2. Go vulnerability database API (vuln.go.dev)
+    3. Package proxy API (proxy.golang.org)
+    """
+    # Method 1: Extract from govulncheck output
+    for pattern in [
+        r"Fixed in:\s*(v[\d.]+\S*)",
+        r"Fixed in:\s*\S+@(v[\d.]+\S*)",
+        rf"{re.escape(package)}@(v[\d.]+\S*)",
+    ]:
+        match = re.search(pattern, govulncheck_out)
+        if match:
+            version = match.group(1)
+            log.info("Fixed version from govulncheck: %s", version)
+            return version
+
+    # Method 2: Go vulnerability database API
+    try:
+        go_vuln_id = ""
+        id_match = re.search(r"(GO-\d{4}-\d+)", govulncheck_out)
+        if id_match:
+            go_vuln_id = id_match.group(1)
+
+        if go_vuln_id:
+            resp = requests.get(f"https://vuln.go.dev/ID/{go_vuln_id}.json", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for affected in data.get("affected", []):
+                    pkg_name = affected.get("package", {}).get("name", "")
+                    if package and package in pkg_name:
+                        for rng in affected.get("ranges", []):
+                            for event in rng.get("events", []):
+                                if "fixed" in event:
+                                    version = event["fixed"]
+                                    log.info("Fixed version from vuln.go.dev (%s): %s", go_vuln_id, version)
+                                    return version if version.startswith("v") else f"v{version}"
+    except Exception as e:
+        log.debug("vuln.go.dev lookup failed: %s", e)
+
+    # Method 3: Check latest version from Go proxy
+    if package and "/" in package:
+        try:
+            resp = requests.get(f"https://proxy.golang.org/{package}/@latest", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                version = data.get("Version", "")
+                if version:
+                    log.info("Latest version from proxy.golang.org: %s (may not be the minimum fix)", version)
+                    return version
+        except Exception as e:
+            log.debug("proxy.golang.org lookup failed: %s", e)
+
+    return ""
+
+
 def apply_fix(repo_dir: str, package: str, fixed_version: str) -> bool:
     """Bump the dependency and run go mod tidy. Returns True on success."""
     target = f"{package}@{fixed_version}" if not fixed_version.startswith("v") else f"{package}@{fixed_version}"
@@ -737,15 +796,9 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             log.warning(result.error)
             return result
 
-        # TODO: look up the fixed version from the Go vuln database
-        # For now we log that the fixed version needs manual input
-        fixed_version = ""
-        if not fixed_version:
-            # Try to extract from govulncheck output
-            fix_match = re.search(r"Fixed in:\s*(v[\d.]+\S*)", govulncheck_out)
-            if fix_match:
-                fixed_version = fix_match.group(1)
+        fixed_version = _lookup_fixed_version(ticket.cve_id, package, govulncheck_out)
         result.fixed_version = fixed_version
+        log.info("Fixed version: %s", fixed_version or "(not found)")
 
         if not fixed_version:
             result.error = "Could not determine fixed version — manual intervention needed"
