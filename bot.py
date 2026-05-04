@@ -759,7 +759,20 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     # Clone the repo
     tmpdir = tempfile.mkdtemp(prefix="cve-fix-")
     try:
-        _run(["git", "clone", "--depth=50", "--branch", branch, repo_url, tmpdir])
+        clone_result = _run(["git", "clone", "--depth=50", "--branch", branch, repo_url, tmpdir], check=False)
+        if clone_result.returncode != 0:
+            log.info("Branch %s not found, trying main/master", branch)
+            for fallback in ["main", "master"]:
+                clone_result = _run(["git", "clone", "--depth=50", "--branch", fallback, repo_url, tmpdir], check=False)
+                if clone_result.returncode == 0:
+                    branch = fallback
+                    result.branch = branch
+                    log.info("Cloned with fallback branch: %s", branch)
+                    break
+            if clone_result.returncode != 0:
+                result.error = f"Could not clone {repo_url} (tried {branch}, main, master)"
+                log.warning(result.error)
+                return result
 
         # Try to identify the package from the summary first
         package = _extract_cve_package(ticket.cve_id, ticket.summary)
