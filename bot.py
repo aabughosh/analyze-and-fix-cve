@@ -672,7 +672,8 @@ def run_tests(repo_dir: str) -> tuple[bool, str]:
 
 
 def create_pr(repo_dir: str, ticket: CVETicket, package: str,
-              old_version: str, fixed_version: str, risk: str) -> str:
+              old_version: str, fixed_version: str, risk: str,
+              repo_url: str = "") -> str:
     """Create a branch, commit, push, and open a PR. Returns the PR URL."""
     branch_name = f"fix-{ticket.cve_id.lower()}-{ticket.version}"
 
@@ -725,8 +726,10 @@ def create_pr(repo_dir: str, ticket: CVETicket, package: str,
 
     result = _run(
         ["gh", "pr", "create",
+         "--head", branch_name,
          "--title", msg,
-         "--body", pr_body],
+         "--body", pr_body,
+         "--repo", repo_url.replace("https://github.com/", "") if repo_url else ""],
         cwd=repo_dir,
         check=False,
     )
@@ -842,7 +845,7 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             return result
 
         # Create PR
-        pr_url = create_pr(tmpdir, ticket, package, current_ver, fixed_version, risk)
+        pr_url = create_pr(tmpdir, ticket, package, current_ver, fixed_version, risk, repo_url)
         result.pr_url = pr_url
 
         # Comment on Jira
