@@ -591,9 +591,9 @@ def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str) -> st
     """
     # Method 1: Extract from govulncheck output
     for pattern in [
-        r"Fixed in:\s*(v[\d.]+\S*)",
-        r"Fixed in:\s*\S+@(v[\d.]+\S*)",
-        rf"{re.escape(package)}@(v[\d.]+\S*)",
+        r"Fixed in:\s*(v[\d.]+[\w.-]*)",
+        r"Fixed in:\s*\S+@(v[\d.]+[\w.-]*)",
+        rf"{re.escape(package)}@(v[\d.]+[\w.-]*)",
     ]:
         match = re.search(pattern, govulncheck_out)
         if match:
