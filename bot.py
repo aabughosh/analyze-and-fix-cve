@@ -49,11 +49,13 @@ OCP_BUILD_DATA_REPO = "https://github.com/openshift-eng/ocp-build-data.git"
 
 RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/tmp/cve-bot-results"))
 
-MANUAL_COMPONENT_MAP = {
-    "networking-ingress-commatrix": ("https://github.com/openshift-kni/commatrix", "main"),
-    "ptp": ("https://github.com/openshift/ptp-operator", "master"),
-    "CNF-Cert-TNF": ("https://github.com/redhat-best-practices-for-k8s/certsuite", "main"),
-}
+MANUAL_COMPONENT_MAP_STR = os.environ.get("COMPONENT_MAP", "")
+MANUAL_COMPONENT_MAP = {}
+for entry in MANUAL_COMPONENT_MAP_STR.split(","):
+    entry = entry.strip()
+    if "=" in entry:
+        comp, repo = entry.split("=", 1)
+        MANUAL_COMPONENT_MAP[comp.strip()] = (repo.strip(), "main")
 
 
 @dataclass
@@ -218,6 +220,22 @@ def map_component_to_repo(component: str, version: str) -> tuple[str, str]:
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    return "", ""
+
+
+def _extract_repo_from_summary(summary: str, version: str) -> tuple[str, str]:
+    """Try to extract a GitHub org/repo from the ticket summary.
+
+    Summaries often look like: 'CVE-XXXX openshift-kni/commatrix: ...'
+    """
+    match = re.search(r"CVE-[\d-]+\s+([\w.-]+/[\w.-]+):", summary)
+    if match:
+        org_repo = match.group(1)
+        repo_url = f"https://github.com/{org_repo}"
+        ocp_version = version.replace("openshift-", "") if version else ""
+        branch = f"release-{ocp_version}" if ocp_version else "main"
+        log.info("Extracted repo from summary: %s branch %s", repo_url, branch)
+        return repo_url, branch
     return "", ""
 
 
@@ -407,8 +425,10 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     result = AnalysisResult(ticket=ticket)
     log.info("Processing %s: %s", ticket.key, ticket.cve_id)
 
-    # Map component to repo
+    # Map component to repo (try multiple methods)
     repo_url, branch = map_component_to_repo(ticket.component, ticket.version)
+    if not repo_url:
+        repo_url, branch = _extract_repo_from_summary(ticket.summary, ticket.version)
     if not repo_url:
         result.error = f"Could not map component '{ticket.component}' to a GitHub repo"
         log.warning(result.error)

@@ -135,7 +135,8 @@ The bot runs as a GitHub Action on a schedule. It automatically:
 
    | Variable | Value |
    |----------|-------|
-   | `TEAM_COMPONENTS` | Comma-separated Jira components (e.g. `ptp,networking-ingress-commatrix`) |
+   | `TEAM_COMPONENTS` | Comma-separated Jira components (e.g. `ptp,networking-ingress-commatrix,Storage`) |
+   | `COMPONENT_MAP` | Optional manual mappings for components not in ocp-build-data (e.g. `networking-ingress-commatrix=https://github.com/openshift-kni/commatrix,ptp=https://github.com/openshift/ptp-operator`) |
    | `DRY_RUN` | `true` for testing, `false` for real PRs |
 
 5. The bot runs **every weekday at 8am UTC**. You can also trigger it
