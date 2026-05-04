@@ -248,6 +248,7 @@ def _extract_cve_package(cve_id: str, summary: str) -> str:
     known_patterns = {
         "grpc": "google.golang.org/grpc",
         "go-jose": "github.com/go-jose/go-jose",
+        "go jose": "github.com/go-jose/go-jose",
         "golang.org/x/crypto": "golang.org/x/crypto",
         "golang.org/x/net": "golang.org/x/net",
         "golang.org/x/text": "golang.org/x/text",
@@ -276,27 +277,43 @@ def analyze_repo(repo_dir: str, cve_id: str, package: str) -> tuple[str, str, st
         return "NOT_GO_PROJECT", "", "", ""
 
     gomod_content = gomod.read_text()
-    if package and package not in gomod_content:
-        return "NOT_AFFECTED", "", "Package not found in go.mod", ""
 
-    version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
-    current_version = version_match.group(1) if version_match else "unknown"
+    if package:
+        if package not in gomod_content:
+            return "NOT_AFFECTED", "", "Package not found in go.mod", ""
+        version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
+        current_version = version_match.group(1) if version_match else "unknown"
+    else:
+        current_version = "unknown"
 
     _run(["go", "install", "golang.org/x/vuln/cmd/govulncheck@latest"], cwd=repo_dir, check=False)
 
     result = _run(["govulncheck", "./..."], cwd=repo_dir, check=False)
     output = result.stdout + result.stderr
+    log.info("govulncheck output (first 500 chars): %s", output[:500])
 
-    if "Symbol Results" in output or "symbol" in output.lower():
+    cve_found = cve_id.lower() in output.lower()
+
+    if "Symbol Results" in output:
         risk = "HIGH"
-    elif "Package Results" in output or "package" in output.lower():
-        risk = "LOW"
-    elif cve_id.lower() in output.lower():
+    elif "Package Results" in output:
+        risk = "LOW" if cve_found else "NOT_AFFECTED"
+    elif cve_found:
         risk = "LOW"
     else:
         risk = "NOT_AFFECTED"
 
-    if "/" not in package:
+    if not package and cve_found:
+        pkg_match = re.search(r"Module:\s+(\S+)", output)
+        if pkg_match:
+            package = pkg_match.group(1)
+            log.info("Auto-detected package from govulncheck: %s", package)
+            version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
+            current_version = version_match.group(1) if version_match else "unknown"
+
+    if not package:
+        fix_type = "UNKNOWN"
+    elif "/" not in package:
         fix_type = "STDLIB"
     elif package.startswith("golang.org/x/"):
         fix_type = "EXTENDED_STDLIB"
@@ -423,21 +440,25 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     try:
         _run(["git", "clone", "--depth=50", "--branch", branch, repo_url, tmpdir])
 
-        # Identify the affected package
+        # Try to identify the package from the summary first
         package = _extract_cve_package(ticket.cve_id, ticket.summary)
         if not package:
-            result.error = "Could not identify the affected Go package from the CVE summary"
-            log.warning(result.error)
-            return result
-        result.package = package
+            log.info("Could not extract package from summary, running govulncheck to detect automatically")
 
-        # Analyze
+        # Analyze (govulncheck runs on the whole repo regardless)
         risk, current_ver, govulncheck_out, fix_type = analyze_repo(tmpdir, ticket.cve_id, package)
         result.risk_level = risk
         result.current_version = current_ver
         result.govulncheck_output = govulncheck_out
         result.fix_type = fix_type
-        log.info("Risk: %s, Fix type: %s, Current: %s", risk, fix_type, current_ver)
+
+        pkg_match = re.search(r"Auto-detected package.*?:\s*(\S+)", govulncheck_out)
+        if not package and "Module:" in govulncheck_out:
+            mod_match = re.search(r"Module:\s+(\S+)", govulncheck_out)
+            if mod_match:
+                package = mod_match.group(1)
+        result.package = package
+        log.info("Risk: %s, Fix type: %s, Package: %s, Current: %s", risk, fix_type, package, current_ver)
 
         if risk == "NOT_AFFECTED" or risk == "NOT_GO_PROJECT":
             log.info("Not affected, skipping")
