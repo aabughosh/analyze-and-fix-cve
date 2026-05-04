@@ -121,10 +121,28 @@ def _jira_add_comment(issue_key: str, body: str) -> None:
     )
 
 
+def _debug_ticket(issue_key: str) -> None:
+    """Fetch a single ticket and log its fields for debugging."""
+    try:
+        data = _jira_get(f"issue/{issue_key}?fields=summary,components,labels,status,resolution,issuetype")
+        fields = data.get("fields", {})
+        log.info("DEBUG %s:", issue_key)
+        log.info("  summary: %s", fields.get("summary", "")[:100])
+        log.info("  status: %s", (fields.get("status") or {}).get("name"))
+        log.info("  resolution: %s", (fields.get("resolution") or {}).get("name", "None (Unresolved)"))
+        log.info("  issuetype: %s", (fields.get("issuetype") or {}).get("name"))
+        log.info("  components: %s", [c.get("name") for c in (fields.get("components") or [])])
+        log.info("  labels: %s", fields.get("labels", []))
+    except Exception as e:
+        log.warning("DEBUG lookup failed for %s: %s", issue_key, e)
+
+
 def fetch_new_cve_tickets() -> list[CVETicket]:
     if not TEAM_COMPONENTS:
         log.error("TEAM_COMPONENTS not set")
         return []
+
+    _debug_ticket("OCPBUGS-81965")
 
     components_jql = ", ".join(f'"{c}"' for c in TEAM_COMPONENTS)
     jql = (
