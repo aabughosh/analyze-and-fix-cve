@@ -273,8 +273,15 @@ def _run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subproce
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=check, timeout=300)
 
 
-def map_component_to_repo(component: str, version: str) -> tuple[str, str]:
-    """Map a Jira component to a GitHub repo URL and branch using ocp-build-data."""
+def map_component_to_repo(component: str, version: str, labels: list[str] | None = None) -> tuple[str, str]:
+    """Map a Jira component to a GitHub repo URL and branch.
+
+    Uses the same approach as Jaspreet's analyze-cve:
+    1. Check manual COMPONENT_MAP
+    2. Extract pscomponent from labels (e.g. openshift4/ose-cluster-storage-rhel9-operator)
+    3. Look up in ocp-build-data delivery_component_mapping.yml
+    4. Read the image YAML to find the GitHub repo URL
+    """
     if component in MANUAL_COMPONENT_MAP:
         repo_url, default_branch = MANUAL_COMPONENT_MAP[component]
         ocp_version = version.replace("openshift-", "") if version else ""
@@ -282,40 +289,74 @@ def map_component_to_repo(component: str, version: str) -> tuple[str, str]:
         log.info("Using manual mapping: %s → %s branch %s", component, repo_url, branch)
         return repo_url, branch
 
+    pscomponent = ""
+    for label in (labels or []):
+        if label.startswith("pscomponent:"):
+            pscomponent = label[len("pscomponent:"):]
+            break
+
+    ocp_branch = version if version else "openshift-4.17"
+    ocp_version = version.replace("openshift-", "") if version else "4.17"
+
     tmpdir = tempfile.mkdtemp(prefix="ocp-build-data-")
     try:
-        branch = version.replace("openshift-", "openshift-") if version else "openshift-4.17"
-        _run(["git", "clone", "--depth=1", "--branch", branch, OCP_BUILD_DATA_REPO, tmpdir])
+        _run(["git", "clone", "--depth=1", "--branch", ocp_branch,
+              OCP_BUILD_DATA_REPO, tmpdir], check=False)
+
+        search_terms = [t for t in [pscomponent, component] if t]
 
         mapping_file = Path(tmpdir) / "delivery_component_mapping.yml"
         if mapping_file.exists():
-            content = mapping_file.read_text()
-            pattern = re.compile(rf"{re.escape(component)}:.*?image_file:\s*(\S+)", re.DOTALL)
-            match = pattern.search(content)
-            if match:
-                image_file = Path(tmpdir) / match.group(1)
-                if image_file.exists():
-                    image_content = image_file.read_text()
-                    repo_match = re.search(r"web:\s*(https://github\.com/\S+)", image_content)
-                    if repo_match:
-                        repo_url = repo_match.group(1).rstrip("/")
-                        ocp_version = version.replace("openshift-", "")
+            mapping_content = mapping_file.read_text()
+            for term in search_terms:
+                pattern = re.compile(rf"^{re.escape(term)}:\s*\n\s*image_file:\s*(\S+)",
+                                     re.MULTILINE)
+                match = pattern.search(mapping_content)
+                if match:
+                    image_path = Path(tmpdir) / match.group(1).strip()
+                    repo_url = _read_repo_from_image_yaml(image_path)
+                    if repo_url:
+                        log.info("ocp-build-data mapping: %s → %s", term, repo_url)
                         return repo_url, f"release-{ocp_version}"
 
         images_dir = Path(tmpdir) / "images"
         if images_dir.exists():
-            for yml in images_dir.glob("*.yml"):
-                content = yml.read_text()
-                if component.lower() in content.lower():
-                    repo_match = re.search(r"web:\s*(https://github\.com/\S+)", content)
-                    if repo_match:
-                        repo_url = repo_match.group(1).rstrip("/")
-                        ocp_version = version.replace("openshift-", "")
-                        return repo_url, f"release-{ocp_version}"
+            for term in search_terms:
+                short_name = term.split("/")[-1] if "/" in term else term
+                short_name = re.sub(r"-rhel\d+-?", "-", short_name).rstrip("-")
+                for yml in images_dir.glob("*.yml"):
+                    if short_name.lower() in yml.name.lower():
+                        repo_url = _read_repo_from_image_yaml(yml)
+                        if repo_url:
+                            log.info("ocp-build-data image file match: %s → %s", yml.name, repo_url)
+                            return repo_url, f"release-{ocp_version}"
+
+            for term in search_terms:
+                for yml in images_dir.glob("*.yml"):
+                    content = yml.read_text()
+                    if term.lower() in content.lower():
+                        repo_url = _read_repo_from_image_yaml(yml)
+                        if repo_url:
+                            log.info("ocp-build-data content match: %s in %s → %s",
+                                     term, yml.name, repo_url)
+                            return repo_url, f"release-{ocp_version}"
+    except Exception as e:
+        log.warning("ocp-build-data lookup failed: %s", e)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     return "", ""
+
+
+def _read_repo_from_image_yaml(path: Path) -> str:
+    """Extract the GitHub repo URL from an ocp-build-data image YAML file."""
+    if not path.exists():
+        return ""
+    content = path.read_text()
+    match = re.search(r"web:\s*(https://github\.com/\S+)", content)
+    if match:
+        return match.group(1).rstrip("/")
+    return ""
 
 
 def _extract_repo_from_summary(summary: str, version: str) -> tuple[str, str]:
@@ -606,7 +647,7 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     log.info("Processing %s: %s", ticket.key, ticket.cve_id)
 
     # Map component to repo (try multiple methods in order)
-    repo_url, branch = map_component_to_repo(ticket.component, ticket.version)
+    repo_url, branch = map_component_to_repo(ticket.component, ticket.version, ticket.labels)
     if not repo_url:
         repo_url, branch = _extract_repo_from_summary(ticket.summary, ticket.version)
     if not repo_url:
