@@ -258,7 +258,7 @@ def fetch_new_cve_tickets() -> list[CVETicket]:
     components_jql = ", ".join(f'"{c}"' for c in TEAM_COMPONENTS)
     jql = (
         f"project = OCPBUGS "
-        f"AND issuetype = Vulnerability "
+        f"AND issuetype in (Vulnerability, Bug) "
         f"AND labels = SecurityTracking "
         f"AND resolution = Unresolved "
         f"AND component in ({components_jql}) "
