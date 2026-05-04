@@ -699,7 +699,10 @@ def create_pr(repo_dir: str, ticket: CVETicket, package: str,
         log.info("[DRY RUN] Would push branch %s and create PR", branch_name)
         return f"[DRY RUN] PR would be created on branch {branch_name}"
 
-    _run(["git", "push", "origin", branch_name], cwd=repo_dir)
+    push_result = _run(["git", "push", "origin", branch_name], cwd=repo_dir, check=False)
+    if push_result.returncode != 0:
+        log.error("git push failed: %s", push_result.stderr)
+        return ""
 
     pr_body = f"""## CVE Fix
 
