@@ -66,6 +66,7 @@ class CVETicket:
     component: str
     version: str
     status: str
+    labels: list = field(default_factory=list)
 
 
 @dataclass
@@ -258,6 +259,7 @@ def fetch_new_cve_tickets() -> list[CVETicket]:
                 component=components[0] if components else "",
                 version=version_match.group(1) if version_match else "",
                 status=(fields.get("status") or {}).get("name", "Unknown"),
+                labels=fields.get("labels", []),
             ))
     return tickets
 
@@ -319,16 +321,39 @@ def map_component_to_repo(component: str, version: str) -> tuple[str, str]:
 def _extract_repo_from_summary(summary: str, version: str) -> tuple[str, str]:
     """Try to extract a GitHub org/repo from the ticket summary.
 
-    Summaries often look like: 'CVE-XXXX openshift-kni/commatrix: ...'
+    Handles multiple formats:
+      CVE-XXXX openshift-kni/commatrix: ...          → github.com/openshift-kni/commatrix
+      CVE-XXXX openshift4/cnf-tests-rhel8: ...       → skipped (container image, not a repo)
+      CVE-XXXX rhcos: ...                             → no repo
     """
     match = re.search(r"CVE-[\d-]+\s+([\w.-]+/[\w.-]+):", summary)
     if match:
         org_repo = match.group(1)
+        if org_repo.startswith("openshift4/") or org_repo.endswith(("-rhel8", "-rhel9")):
+            log.info("Skipping container image name: %s", org_repo)
+            return "", ""
         repo_url = f"https://github.com/{org_repo}"
         ocp_version = version.replace("openshift-", "") if version else ""
         branch = f"release-{ocp_version}" if ocp_version else "main"
         log.info("Extracted repo from summary: %s branch %s", repo_url, branch)
         return repo_url, branch
+    return "", ""
+
+
+def _extract_repo_from_labels(labels: list[str], version: str) -> tuple[str, str]:
+    """Try to extract a GitHub repo from pscomponent label.
+
+    Labels often include: pscomponent:openshift-kni/commatrix
+    """
+    for label in labels:
+        if label.startswith("pscomponent:"):
+            pscomp = label[len("pscomponent:"):]
+            if "/" in pscomp and not pscomp.startswith("openshift4/"):
+                repo_url = f"https://github.com/{pscomp}"
+                ocp_version = version.replace("openshift-", "") if version else ""
+                branch = f"release-{ocp_version}" if ocp_version else "main"
+                log.info("Extracted repo from pscomponent label: %s branch %s", repo_url, branch)
+                return repo_url, branch
     return "", ""
 
 
@@ -580,10 +605,12 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     result = AnalysisResult(ticket=ticket)
     log.info("Processing %s: %s", ticket.key, ticket.cve_id)
 
-    # Map component to repo (try multiple methods)
+    # Map component to repo (try multiple methods in order)
     repo_url, branch = map_component_to_repo(ticket.component, ticket.version)
     if not repo_url:
         repo_url, branch = _extract_repo_from_summary(ticket.summary, ticket.version)
+    if not repo_url:
+        repo_url, branch = _extract_repo_from_labels(ticket.labels, ticket.version)
     if not repo_url:
         result.error = f"Could not map component '{ticket.component}' to a GitHub repo"
         log.warning(result.error)
