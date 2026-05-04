@@ -676,6 +676,9 @@ def create_pr(repo_dir: str, ticket: CVETicket, package: str,
     """Create a branch, commit, push, and open a PR. Returns the PR URL."""
     branch_name = f"fix-{ticket.cve_id.lower()}-{ticket.version}"
 
+    _run(["git", "config", "user.email", "cve-bot@redhat.com"], cwd=repo_dir, check=False)
+    _run(["git", "config", "user.name", "CVE Bot"], cwd=repo_dir, check=False)
+
     _run(["git", "checkout", "-b", branch_name], cwd=repo_dir)
 
     is_upstream = False
