@@ -462,6 +462,15 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
 
         if risk == "NOT_AFFECTED" or risk == "NOT_GO_PROJECT":
             log.info("Not affected, skipping")
+            comment = (
+                f"CVE Bot Analysis for {ticket.cve_id}:\n"
+                f"- Repository: {repo_url} (branch: {branch})\n"
+                f"- Result: NOT AFFECTED\n"
+                f"- Reason: {'Not a Go project' if risk == 'NOT_GO_PROJECT' else 'Vulnerable package not found in dependencies or not called by code'}\n"
+                f"- Tool: govulncheck\n"
+                f"\nNo action required."
+            )
+            _jira_add_comment(ticket.key, comment)
             return result
 
         if fix_type == "STDLIB":
