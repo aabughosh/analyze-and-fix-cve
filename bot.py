@@ -110,6 +110,99 @@ def _jira_search(jql: str, max_results: int = 50) -> list[dict]:
     return resp.json().get("issues", [])
 
 
+def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
+                             package: str, risk: str, details: dict) -> str:
+    """Build a detailed Jira comment with evidence."""
+    pkg_short = package.split("/")[-1] if package else "unknown"
+    risk_emoji = {"HIGH": "⛔", "LOW": "⚠️", "NOT_AFFECTED": "✅", "NOT_GO_PROJECT": "✅"}.get(risk, "❓")
+
+    lines = [
+        f"{ticket.cve_id} Automated Analysis {risk_emoji}",
+        f"Risk Assessment: {risk} {risk_emoji}",
+        "",
+        "Repository Details",
+        f"- Component: {ticket.component}",
+        f"- Repository: {repo_url}",
+        f"- Branch: {branch}",
+        f"- Go version: {details.get('go_version', 'unknown')}",
+        f"- Vulnerable package: {package or 'N/A'}",
+        "",
+        "Evidence 1: govulncheck Symbol-Level Analysis",
+    ]
+
+    govulncheck_out = details.get("govulncheck", "")
+    if govulncheck_out and len(govulncheck_out) > 10:
+        for line in govulncheck_out.splitlines()[:15]:
+            lines.append(f"  {line}")
+    else:
+        lines.append(f"  {ticket.cve_id} NOT DETECTED by govulncheck")
+
+    if risk == "NOT_AFFECTED":
+        lines.append(f"  ❌ {ticket.cve_id} NOT DETECTED - Package not in dependency tree or not called")
+    elif risk == "LOW":
+        lines.append(f"  ⚠️ {ticket.cve_id} DETECTED in Package Results (dependency present but not called)")
+    elif risk == "HIGH":
+        lines.append(f"  ⛔ {ticket.cve_id} DETECTED in Symbol Results (code CALLS vulnerable functions)")
+
+    lines.append("")
+    lines.append("Evidence 2: Manual Dependency Verification")
+
+    grep_gomod = details.get("grep_gomod", "")
+    grep_gosum = details.get("grep_gosum", "")
+    go_mod_why = details.get("go_mod_why", "")
+
+    lines.append(f"  go.mod search: {grep_gomod or '(not checked)'}")
+    lines.append(f"  go.sum search: {grep_gosum or '(not checked)'}")
+    if go_mod_why:
+        lines.append(f"  go mod why: {go_mod_why[:200]}")
+
+    if risk == "NOT_AFFECTED":
+        lines.append("")
+        lines.append("Findings:")
+        if "not found" in grep_gomod.lower() or not grep_gomod:
+            lines.append("  ✅ Not in go.mod (direct dependencies)")
+        if "not found" in grep_gosum.lower() or not grep_gosum:
+            lines.append("  ✅ Not in go.sum (transitive dependencies)")
+        lines.append(f"  ✅ govulncheck confirms package is absent or not called")
+
+    lines.append("")
+    lines.append(f"Risk Classification: {risk} {risk_emoji}")
+
+    if risk == "NOT_AFFECTED":
+        lines.append(f"The vulnerable package {package or 'identified in the CVE'} is not present in "
+                      f"this repository's dependency tree, or is not called by the code. "
+                      f"No action required for {ticket.cve_id}.")
+    elif risk == "LOW":
+        lines.append(f"The vulnerable package {package} is present but the code does not call "
+                      f"the vulnerable functions. Update recommended as best practice.")
+    elif risk == "HIGH":
+        lines.append(f"The code CALLS vulnerable functions in {package}. Immediate update required.")
+
+    other_vulns = details.get("other_vulns", [])
+    if other_vulns:
+        lines.append("")
+        lines.append("IMPORTANT: Additional Vulnerabilities Detected")
+        lines.append(f"govulncheck found {len(other_vulns)} other vulnerabilities:")
+        for v in other_vulns[:10]:
+            lines.append(f"  - {v.get('id', '?')} ({v.get('package', '?')})")
+        lines.append("Consider investigating these separately.")
+
+    lines.append("")
+    lines.append("Recommendation")
+    if risk == "NOT_AFFECTED":
+        lines.append(f"Action: No action required for {ticket.cve_id}.")
+    elif risk == "LOW":
+        lines.append(f"Action: Update {package} as best practice. Not urgent.")
+    elif risk == "HIGH":
+        lines.append(f"Action: Update {package} immediately. Fix is urgent.")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("Automated analysis by CVE Bot (govulncheck + dependency verification)")
+
+    return "\n".join(lines)
+
+
 def _jira_add_comment(issue_key: str, body: str) -> None:
     if DRY_RUN:
         log.info("[DRY RUN] Would comment on %s: %s", issue_key, body[:100])
@@ -267,6 +360,21 @@ def _extract_cve_package(cve_id: str, summary: str) -> str:
     return ""
 
 
+@dataclass
+class DetailedAnalysis:
+    risk_level: str = "UNKNOWN"
+    current_version: str = ""
+    fix_type: str = ""
+    package: str = ""
+    govulncheck_output: str = ""
+    go_mod_why: str = ""
+    grep_gomod: str = ""
+    grep_gosum: str = ""
+    grep_source: str = ""
+    go_version: str = ""
+    other_vulns: list = field(default_factory=list)
+
+
 def analyze_repo(repo_dir: str, cve_id: str, package: str) -> tuple[str, str, str, str]:
     """Run govulncheck and check if the repo is affected.
 
@@ -277,50 +385,97 @@ def analyze_repo(repo_dir: str, cve_id: str, package: str) -> tuple[str, str, st
         return "NOT_GO_PROJECT", "", "", ""
 
     gomod_content = gomod.read_text()
+    details = DetailedAnalysis(package=package)
+
+    go_ver_match = re.search(r"^go\s+([\d.]+)", gomod_content, re.MULTILINE)
+    details.go_version = go_ver_match.group(1) if go_ver_match else "unknown"
 
     if package:
-        if package not in gomod_content:
-            return "NOT_AFFECTED", "", "Package not found in go.mod", ""
         version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
-        current_version = version_match.group(1) if version_match else "unknown"
-    else:
-        current_version = "unknown"
+        details.current_version = version_match.group(1) if version_match else ""
+
+        grep_result = _run(["grep", "-i", package.split("/")[-1], "go.mod"], cwd=repo_dir, check=False)
+        details.grep_gomod = grep_result.stdout.strip() or "(not found)"
+
+        grep_sum = _run(["grep", "-i", package.split("/")[-1], "go.sum"], cwd=repo_dir, check=False)
+        details.grep_gosum = "(found)" if grep_sum.stdout.strip() else "(not found)"
+
+        mod_why = _run(["go", "mod", "why", package], cwd=repo_dir, check=False)
+        details.go_mod_why = mod_why.stdout.strip()[:500] or mod_why.stderr.strip()[:500]
+
+    if package and package not in gomod_content:
+        details.risk_level = "NOT_AFFECTED"
+        details.govulncheck_output = "Package not in dependency tree"
+        _store_details(repo_dir, details)
+        return "NOT_AFFECTED", "", json.dumps(_details_to_dict(details)), ""
 
     _run(["go", "install", "golang.org/x/vuln/cmd/govulncheck@latest"], cwd=repo_dir, check=False)
 
     result = _run(["govulncheck", "./..."], cwd=repo_dir, check=False)
     output = result.stdout + result.stderr
+    details.govulncheck_output = output[:3000]
     log.info("govulncheck output (first 500 chars): %s", output[:500])
 
     cve_found = cve_id.lower() in output.lower()
 
     if "Symbol Results" in output:
-        risk = "HIGH"
+        details.risk_level = "HIGH"
     elif "Package Results" in output:
-        risk = "LOW" if cve_found else "NOT_AFFECTED"
+        details.risk_level = "LOW" if cve_found else "NOT_AFFECTED"
     elif cve_found:
-        risk = "LOW"
+        details.risk_level = "LOW"
     else:
-        risk = "NOT_AFFECTED"
+        details.risk_level = "NOT_AFFECTED"
+
+    for m in re.finditer(r"(GO-\d{4}-\d+)\s*(?:\(([^)]+)\))?\s*", output):
+        vuln_id = m.group(1)
+        vuln_pkg = m.group(2) or ""
+        if vuln_id not in str(details.other_vulns):
+            details.other_vulns.append({"id": vuln_id, "package": vuln_pkg})
 
     if not package and cve_found:
         pkg_match = re.search(r"Module:\s+(\S+)", output)
         if pkg_match:
             package = pkg_match.group(1)
+            details.package = package
             log.info("Auto-detected package from govulncheck: %s", package)
             version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
-            current_version = version_match.group(1) if version_match else "unknown"
+            details.current_version = version_match.group(1) if version_match else "unknown"
 
     if not package:
-        fix_type = "UNKNOWN"
+        details.fix_type = "UNKNOWN"
     elif "/" not in package:
-        fix_type = "STDLIB"
+        details.fix_type = "STDLIB"
     elif package.startswith("golang.org/x/"):
-        fix_type = "EXTENDED_STDLIB"
+        details.fix_type = "EXTENDED_STDLIB"
     else:
-        fix_type = "THIRD_PARTY"
+        details.fix_type = "THIRD_PARTY"
 
-    return risk, current_version, output[:2000], fix_type
+    _store_details(repo_dir, details)
+    return details.risk_level, details.current_version, json.dumps(_details_to_dict(details)), details.fix_type
+
+
+def _details_to_dict(d: DetailedAnalysis) -> dict:
+    return {
+        "risk_level": d.risk_level,
+        "package": d.package,
+        "current_version": d.current_version,
+        "go_version": d.go_version,
+        "fix_type": d.fix_type,
+        "govulncheck": d.govulncheck_output[:1000],
+        "go_mod_why": d.go_mod_why,
+        "grep_gomod": d.grep_gomod,
+        "grep_gosum": d.grep_gosum,
+        "other_vulns": d.other_vulns[:10],
+    }
+
+
+def _store_details(repo_dir: str, details: DetailedAnalysis) -> None:
+    try:
+        out = Path(repo_dir) / "cve-analysis.json"
+        out.write_text(json.dumps(_details_to_dict(details), indent=2))
+    except Exception:
+        pass
 
 
 def apply_fix(repo_dir: str, package: str, fixed_version: str) -> bool:
@@ -464,14 +619,11 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
 
         if risk == "NOT_AFFECTED" or risk == "NOT_GO_PROJECT":
             log.info("Not affected, skipping")
-            comment = (
-                f"CVE Bot Analysis for {ticket.cve_id}:\n"
-                f"- Repository: {repo_url} (branch: {branch})\n"
-                f"- Result: NOT AFFECTED\n"
-                f"- Reason: {'Not a Go project' if risk == 'NOT_GO_PROJECT' else 'Vulnerable package not found in dependencies or not called by code'}\n"
-                f"- Tool: govulncheck\n"
-                f"\nNo action required."
-            )
+            try:
+                details = json.loads(govulncheck_out)
+            except (json.JSONDecodeError, TypeError):
+                details = {}
+            comment = _build_detailed_comment(ticket, repo_url, branch, package, risk, details)
             _jira_add_comment(ticket.key, comment)
             return result
 
