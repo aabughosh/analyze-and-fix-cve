@@ -146,25 +146,52 @@ def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
         lines.append(f"  ⛔ {ticket.cve_id} DETECTED in Symbol Results (code CALLS vulnerable functions)")
 
     lines.append("")
-    lines.append("Evidence 2: Manual Dependency Verification")
+    lines.append("Evidence 2: Dependency Analysis (go.mod/go.sum)")
 
     grep_gomod = details.get("grep_gomod", "")
     grep_gosum = details.get("grep_gosum", "")
     go_mod_why = details.get("go_mod_why", "")
 
-    lines.append(f"  go.mod search: {grep_gomod or '(not checked)'}")
-    lines.append(f"  go.sum search: {grep_gosum or '(not checked)'}")
+    lines.append(f"  $ grep -i \"{pkg_short}\" go.mod")
+    lines.append(f"  {grep_gomod or '(no output)'}")
+    lines.append(f"  $ grep -i \"{pkg_short}\" go.sum")
+    lines.append(f"  {grep_gosum or '(no output)'}")
     if go_mod_why:
-        lines.append(f"  go mod why: {go_mod_why[:200]}")
+        lines.append(f"  $ go mod why {package}")
+        lines.append(f"  {go_mod_why[:200]}")
+
+    gomod_absent = "not found" in grep_gomod.lower() or not grep_gomod
+    gosum_absent = "not found" in grep_gosum.lower() or not grep_gosum
+
+    lines.append("  Findings:")
+    if gomod_absent:
+        lines.append(f"  {'✅' if risk == 'NOT_AFFECTED' else '❌'} {package or 'Package'} is NOT present in go.mod")
+    else:
+        lines.append(f"  ⚠️ {package or 'Package'} IS present in go.mod")
+    if gosum_absent:
+        lines.append(f"  {'✅' if risk == 'NOT_AFFECTED' else '❌'} {package or 'Package'} is NOT present in go.sum")
+    else:
+        lines.append(f"  ⚠️ {package or 'Package'} IS present in go.sum")
+
+    lines.append("")
+    lines.append("Evidence 3: Source Code Analysis")
+    grep_source = details.get("grep_source", "")
+    lines.append(f"  $ grep -r \"{pkg_short}\" . --include=*.go -l")
+    lines.append(f"  {grep_source or '(no output - no references found)'}")
+    if "not found" in grep_source.lower() or grep_source.startswith("(no"):
+        lines.append(f"  Findings:")
+        lines.append(f"  ✅ No import statements for {pkg_short}")
+        lines.append(f"  ✅ No code references to {pkg_short} functionality")
+    else:
+        lines.append(f"  Findings:")
+        lines.append(f"  ⚠️ Source code references to {pkg_short} found in the files above")
 
     if risk == "NOT_AFFECTED":
         lines.append("")
-        lines.append("Findings:")
-        if "not found" in grep_gomod.lower() or not grep_gomod:
-            lines.append("  ✅ Not in go.mod (direct dependencies)")
-        if "not found" in grep_gosum.lower() or not grep_gosum:
-            lines.append("  ✅ Not in go.sum (transitive dependencies)")
-        lines.append(f"  ✅ govulncheck confirms package is absent or not called")
+        lines.append("Triple-Verification Consensus:")
+        lines.append(f"  Dependency check: {'✅' if gomod_absent else '⚠️'} {'No' if gomod_absent else 'Found'} {pkg_short} in go.mod/go.sum")
+        lines.append(f"  Code analysis: {'✅' if 'not found' in grep_source.lower() or grep_source.startswith('(no') else '⚠️'} {'No' if 'not found' in grep_source.lower() or grep_source.startswith('(no') else 'Found'} {pkg_short} imports or references")
+        lines.append(f"  govulncheck: ✅ Package is absent or not called")
 
     lines.append("")
     lines.append(f"Risk Classification: {risk} {risk_emoji}")
@@ -460,14 +487,23 @@ def analyze_repo(repo_dir: str, cve_id: str, package: str) -> tuple[str, str, st
         version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
         details.current_version = version_match.group(1) if version_match else ""
 
-        grep_result = _run(["grep", "-i", package.split("/")[-1], "go.mod"], cwd=repo_dir, check=False)
+        pkg_short = package.split("/")[-1]
+
+        grep_result = _run(["grep", "-i", pkg_short, "go.mod"], cwd=repo_dir, check=False)
         details.grep_gomod = grep_result.stdout.strip() or "(not found)"
 
-        grep_sum = _run(["grep", "-i", package.split("/")[-1], "go.sum"], cwd=repo_dir, check=False)
-        details.grep_gosum = "(found)" if grep_sum.stdout.strip() else "(not found)"
+        grep_sum = _run(["grep", "-i", pkg_short, "go.sum"], cwd=repo_dir, check=False)
+        details.grep_gosum = grep_sum.stdout.strip()[:200] if grep_sum.stdout.strip() else "(not found)"
 
         mod_why = _run(["go", "mod", "why", package], cwd=repo_dir, check=False)
         details.go_mod_why = mod_why.stdout.strip()[:500] or mod_why.stderr.strip()[:500]
+
+        source_grep = _run(["grep", "-r", pkg_short, ".", "--include=*.go", "-l"],
+                           cwd=repo_dir, check=False)
+        if source_grep.stdout.strip():
+            details.grep_source = source_grep.stdout.strip()[:500]
+        else:
+            details.grep_source = "(no source code references found)"
 
     if package and package not in gomod_content:
         details.risk_level = "NOT_AFFECTED"
@@ -532,6 +568,7 @@ def _details_to_dict(d: DetailedAnalysis) -> dict:
         "go_mod_why": d.go_mod_why,
         "grep_gomod": d.grep_gomod,
         "grep_gosum": d.grep_gosum,
+        "grep_source": d.grep_source,
         "other_vulns": d.other_vulns[:10],
     }
 
