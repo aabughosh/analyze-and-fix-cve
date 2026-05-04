@@ -762,14 +762,19 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     result.branch = branch
     log.info("Mapped to %s branch %s", repo_url, branch)
 
-    # Clone the repo
+    # Clone the repo (inject token for push access)
     tmpdir = tempfile.mkdtemp(prefix="cve-fix-")
     try:
-        clone_result = _run(["git", "clone", "--depth=50", "--branch", branch, repo_url, tmpdir], check=False)
+        auth_repo_url = repo_url
+        gh_token = os.environ.get("GITHUB_TOKEN", "")
+        if gh_token and "github.com" in repo_url:
+            auth_repo_url = repo_url.replace("https://github.com/", f"https://x-access-token:{gh_token}@github.com/")
+
+        clone_result = _run(["git", "clone", "--depth=50", "--branch", branch, auth_repo_url, tmpdir], check=False)
         if clone_result.returncode != 0:
             log.info("Branch %s not found, trying main/master", branch)
             for fallback in ["main", "master"]:
-                clone_result = _run(["git", "clone", "--depth=50", "--branch", fallback, repo_url, tmpdir], check=False)
+                clone_result = _run(["git", "clone", "--depth=50", "--branch", fallback, auth_repo_url, tmpdir], check=False)
                 if clone_result.returncode == 0:
                     branch = fallback
                     result.branch = branch
