@@ -49,6 +49,12 @@ OCP_BUILD_DATA_REPO = "https://github.com/openshift-eng/ocp-build-data.git"
 
 RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/tmp/cve-bot-results"))
 
+MANUAL_COMPONENT_MAP = {
+    "networking-ingress-commatrix": ("https://github.com/openshift-kni/commatrix", "main"),
+    "ptp": ("https://github.com/openshift/ptp-operator", "master"),
+    "CNF-Cert-TNF": ("https://github.com/redhat-best-practices-for-k8s/certsuite", "main"),
+}
+
 
 @dataclass
 class CVETicket:
@@ -190,6 +196,13 @@ def _run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subproce
 
 def map_component_to_repo(component: str, version: str) -> tuple[str, str]:
     """Map a Jira component to a GitHub repo URL and branch using ocp-build-data."""
+    if component in MANUAL_COMPONENT_MAP:
+        repo_url, default_branch = MANUAL_COMPONENT_MAP[component]
+        ocp_version = version.replace("openshift-", "") if version else ""
+        branch = f"release-{ocp_version}" if ocp_version else default_branch
+        log.info("Using manual mapping: %s → %s branch %s", component, repo_url, branch)
+        return repo_url, branch
+
     tmpdir = tempfile.mkdtemp(prefix="ocp-build-data-")
     try:
         branch = version.replace("openshift-", "openshift-") if version else "openshift-4.17"
