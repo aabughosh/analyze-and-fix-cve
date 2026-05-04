@@ -597,7 +597,7 @@ def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str) -> st
     ]:
         match = re.search(pattern, govulncheck_out)
         if match:
-            version = match.group(1)
+            version = match.group(1).strip()
             log.info("Fixed version from govulncheck: %s", version)
             return version
 
