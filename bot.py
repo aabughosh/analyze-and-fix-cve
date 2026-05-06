@@ -866,11 +866,13 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             return result
 
         # Run tests
+        log.info("Running go test ./...")
         tests_passed, test_output = run_tests(tmpdir)
         if not tests_passed:
             result.error = f"Tests failed after applying fix:\n{test_output[:500]}"
             log.warning(result.error)
             return result
+        log.info("Tests passed ✓")
 
         # Create PR
         pr_url = create_pr(tmpdir, ticket, package, current_ver, fixed_version, risk, repo_url)
