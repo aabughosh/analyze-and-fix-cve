@@ -1,21 +1,30 @@
 # Analyze and Fix CVE
 
-AI skill for Cursor and Claude Code that analyzes whether a Go repository is
-affected by a specific CVE, and if affected, automatically applies the fix
-and creates a pull request.
+Automated CVE detection, analysis, fixing, and PR creation for Go repositories.
+Works as a **GitHub Action bot** (runs on a schedule, no human needed) and as
+an **AI skill** for Cursor/Claude Code (interactive use).
 
 ## What it does
 
-Give it a CVE ID and a Go repo. It will:
+Given a CVE and a Go repository, it performs the full analysis and fix pipeline:
 
-1. **Look up the CVE** — find the affected package and fixed version
-2. **Check your repo** — is the vulnerable package in `go.mod`?
-3. **Run `govulncheck`** — does your code actually call the vulnerable functions?
-4. **Report the risk** — HIGH (code calls vulnerable functions), LOW (dependency
-   exists but not called), or NOT AFFECTED
-5. **Apply the fix** — bump the dependency to the fixed version
-6. **Run tests** — make sure nothing breaks
-7. **Create a PR** — with full CVE details, analysis results, and test status
+1. **Find CVE tickets** — queries Jira for new unresolved CVE tickets assigned to your team
+2. **Find the repo** — maps the Jira component to a GitHub repository automatically (via ocp-build-data, ticket summary, or pscomponent label)
+3. **Check dependencies** — searches `go.mod` and `go.sum` for the vulnerable package
+4. **Run `govulncheck`** — symbol-level analysis to determine if your code **actually calls** the vulnerable functions (not just whether the dependency exists)
+5. **Classify the risk:**
+   - **HIGH** — code calls vulnerable functions → fix immediately
+   - **LOW** — dependency exists but vulnerable functions are not called → fix as best practice
+   - **NOT AFFECTED** — package not in repo or already on a fixed version → no action needed
+6. **Categorize the fix type:**
+   - **THIRD_PARTY** (e.g. `github.com/go-jose/go-jose`) → auto-fix by bumping dependency
+   - **EXTENDED_STDLIB** (e.g. `golang.org/x/net`) → auto-fix by bumping dependency
+   - **STDLIB** (e.g. `crypto/tls`) → cannot auto-fix, requires Go toolchain update from another team
+7. **Find the fixed version** — looks up the fix version from govulncheck output, the Go vulnerability database (vuln.go.dev), or the Go module proxy
+8. **Apply the fix** — runs `go get package@fixed-version` and `go mod tidy` to bump the dependency
+9. **Run tests** — runs `go test ./...` to make sure the fix does not break anything. If tests fail, the bot **stops and does not create a PR**
+10. **Create a PR** — pushes a branch and opens a pull request with full CVE details, analysis evidence, and test results. For repos you do not own, it forks the repo first
+11. **Post to Jira** — comments on the Jira ticket with a detailed analysis report including triple-verification evidence (govulncheck + dependency check + source code analysis)
 
 ## Quick start
 
@@ -68,29 +77,37 @@ Is ptp-operator vulnerable to CVE-2026-34986?
 ## How it works
 
 ```
-CVE-2026-34986
+Jira ticket: OCPBUGS-84945 (CVE-2026-4441)
      │
      ▼
-Look up CVE → affected package: go-jose, fixed: v4.1.4
+Find repo → extract "aabughosh/cve-bot-test" from ticket summary
      │
      ▼
-Check go.mod → go-jose v4.0.2 (VULNERABLE)
+Clone repo → fallback to main if release branch does not exist
      │
      ▼
-Run govulncheck → Package Results only (LOW RISK)
+Check go.mod → golang.org/x/net v0.23.0 (VULNERABLE)
      │
      ▼
-Categorize → THIRD_PARTY → can auto-fix
+Run govulncheck → Symbol Results: main.go calls html.Parse → HIGH RISK
      │
      ▼
-go get github.com/go-jose/go-jose/v4@v4.1.4
-go mod tidy
+Categorize → EXTENDED_STDLIB → can auto-fix
      │
      ▼
-Run tests → all pass
+Find fixed version → govulncheck says v0.45.0
      │
      ▼
-Create PR → https://github.com/org/repo/pull/42
+Apply fix → go get golang.org/x/net@v0.45.0 && go mod tidy
+     │
+     ▼
+Run tests → go test ./... → all pass ✓
+     │
+     ▼
+Create PR → https://github.com/aabughosh/cve-bot-test/pull/1
+     │
+     ▼
+Comment on Jira → detailed analysis with triple-verification evidence
 ```
 
 ## Risk levels
@@ -111,13 +128,21 @@ Create PR → https://github.com/org/repo/pull/42
 
 ## Bot mode (automated)
 
-The bot runs as a GitHub Action on a schedule. It automatically:
+The bot runs as a GitHub Action on a schedule (every weekday at 8am UTC).
+No human intervention needed. It handles everything end-to-end:
 
-1. Fetches new CVE tickets from Jira assigned to your team's components
-2. Maps each ticket to a GitHub repo
-3. Runs `govulncheck` to check if the code is affected
-4. If affected, bumps the dependency and creates a PR
-5. Posts the results back to the Jira ticket
+1. **Fetch new tickets** — queries Jira for unresolved CVE tickets assigned to your team's components
+2. **Find the repo** — maps the Jira ticket to a GitHub repository using ocp-build-data, the ticket summary (`org/repo`), or the pscomponent label
+3. **Clone and analyze** — clones the repo, runs `govulncheck ./...` for symbol-level vulnerability analysis
+4. **Check dependencies** — verifies if the vulnerable package is in `go.mod`, `go.sum`, and source code (triple-verification)
+5. **Classify risk** — HIGH (code calls vulnerable functions), LOW (dependency present but not called), or NOT AFFECTED
+6. **Find fixed version** — looks up the fix version from govulncheck, vuln.go.dev, or proxy.golang.org
+7. **Apply fix** — bumps the dependency (`go get package@fixed-version && go mod tidy`)
+8. **Run tests** — runs `go test ./...` to verify the fix does not break anything. **If tests fail, the bot stops and does not create a PR**
+9. **Create PR** — pushes a fix branch and opens a pull request with CVE details, analysis, and test results. For repos you do not own, it **forks the repo first** and creates the PR from your fork
+10. **Post to Jira** — comments on the Jira ticket with a detailed analysis report and the PR link
+
+If a CVE is **NOT AFFECTED**, the bot posts a detailed comment on Jira explaining why (with evidence) and moves on. No PR is created.
 
 ### Setup
 
