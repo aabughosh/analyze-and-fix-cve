@@ -8,258 +8,84 @@ description: >-
 
 # Analyze and Fix CVE
 
-Determine if a Go repository is affected by a specific CVE. If affected,
-apply the dependency fix and create a pull request automatically.
+## CRITICAL RULE
 
-## Trigger phrases
-
-- "Check if this repo is affected by CVE-XXXX"
-- "Analyze and fix CVE-XXXX in this repo"
-- "Is ptp-operator vulnerable to CVE-XXXX?"
-- "Fix CVE-XXXX and open a PR"
+During detection (Steps 2-3), rely **only** on the scanner and its database. Do not fetch CVE details from external sources (no cve.org, no NVD, no CVSS lookups). Do not manually grep `go.mod`, `go.sum`, or source files. Do not second-guess the scanner. The scanner is the single source of truth — if it does not report the CVE, the repo is not affected. Move on.
 
 ## Prerequisites
 
-- Go 1.20+ installed
-- `gh` CLI installed and authenticated (`gh auth login`)
-- The repo must have a `go.mod` file (Go projects only)
+Go 1.20+, a way to create PRs on the hosting platform, repo has `go.mod`.
 
-## Step 1: Gather information
+## 1. Gather inputs
 
-Ask the user for any missing details:
+Ask the user for anything missing:
 
-1. **CVE ID** — e.g. `CVE-2026-34986`
-2. **Repository** — use the current working directory if not specified
-3. **Branch** — use the current branch if not specified, or ask which
-   release branch (e.g. `release-4.21`)
+1. **CVE ID** (e.g. `CVE-2026-34986`)
+2. **Repository** — a remote URL or local path. Default to current working directory.
+3. **Branch** — default to current branch
 
-## Step 2: Look up the CVE
+If the repository is a remote URL, clone it (with the target branch) into a temporary directory inside the current working directory (to satisfy sandbox restrictions). Delete this directory when done. If it's a local path, work in that directory directly. Confirm `go.mod` exists before proceeding.
 
-Search for CVE details to identify the affected package and fixed version.
+## 2. Validate the CVE
 
-```bash
-# Check the Go vulnerability database
-go install golang.org/x/vuln/cmd/govulncheck@latest 2>/dev/null
-govulncheck -json ./... 2>/dev/null | head -100
-```
+Using only the scanner's own database:
 
-If the CVE ID is known, also check:
-- `https://pkg.go.dev/vuln/{CVE-ID}`
-- `https://www.cve.org/CVERecord?id={CVE-ID}`
+1. Verify the CVE ID exists and is tracked. If not recognized -> report that the CVE is not in the database and stop.
+2. Learn how the scanner identifies vulnerabilities in its output (it may use its own ID scheme, not CVE IDs). Note the scanner's ID for the target CVE.
+3. Learn what fields the scanner reports so you know what to extract after scanning.
 
-Extract:
-- **Affected package** (e.g. `github.com/go-jose/go-jose/v4`)
-- **Vulnerable versions** (e.g. `< 4.1.4`)
-- **Fixed version** (e.g. `4.1.4`)
+Do not look up CVE details from any other source during this step.
 
-## Step 3: Check if the repo is affected
+### If using govulncheck
 
-### 3a. Check if the package is in go.mod
+To validate, HTTP GET `https://api.osv.dev/v1/vulns/<CVE-ID>`. A successful response confirms the CVE is tracked and returns the Go vulnerability ID (alias) and affected packages/versions.
 
-```bash
-grep "<package-name>" go.mod
-```
+## 3. Scan for the CVE
 
-If not found → **NOT AFFECTED**. Report to the user and stop.
+Scan the cloned repo for vulnerabilities and process the output with a simple filter to match the CVE ID or its aliases. The scanner should be configured to output all details to match on the CVE ID or its aliases. Also save the full output to a local file.
+If there is no match, the repo is not affected. Report findings and stop.
 
-### 3b. Check the version
+### If using govulncheck
 
-Compare the version in `go.mod` against the vulnerable range.
+Use JSON output (-json) since it contains both CVE ID and its aliases.
 
-- If already on the fixed version or newer → **NOT AFFECTED**. Report and stop.
-- If on a vulnerable version → continue to Step 3c.
+## 4. Report findings
 
-### 3c. Run govulncheck for symbol-level analysis
+Summarize the full scanning file. First show the CVE that was matched. Then as extra data, list all other vulnerabilities found by CVE ID / Aliases.
 
-```bash
-govulncheck ./...
-```
+- **NOT AFFECTED** -> stop
+- **LOW** -> ask user whether to fix (recommended). If no, stop.
+- **HIGH** -> proceed automatically
 
-Interpret the results:
+## 5. Classify and fix
 
-| govulncheck output | Risk level | Meaning |
-|--------------------|------------|---------|
-| Listed in **Symbol Results** with call traces | **HIGH RISK** | Code CALLS the vulnerable functions |
-| Listed in **Package Results** only | **LOW RISK** | Dependency exists but vulnerable functions are not called |
-| No results | **NOT AFFECTED** | Not vulnerable |
+Classify the package:
 
-### 3d. Check the dependency chain
+- No domain (`crypto/tls`, `net/http`) -> **STDLIB**: requires Go toolchain update, cannot auto-fix. Tell user to coordinate with `openshift-golang-builder-container` team. Stop.
+- `golang.org/x/*` -> **EXTENDED_STDLIB**: fixable
+- Other domain -> **THIRD_PARTY**: fixable
 
-```bash
-go mod why <package-name>
-```
+**5a.** Create a branch named `fix-cve-<CVE-ID>-<branch-name>`.
 
-This shows how the dependency is pulled in (direct vs transitive).
+**5b.** Bump the dependency to the fixed version, tidy the module graph, and re-vendor if the repo uses vendoring.
 
-## Step 4: Report findings
+**5c.** Run the project's tests. If tests fail, report failure and stop. Do NOT create a PR with failing tests.
 
-Present a clear summary to the user:
+**5d.** Check recent commit messages for `UPSTREAM:` prefix. If present, use commit format `UPSTREAM: <carry>: Bump <package> to v<fixed> for <CVE-ID>`. Otherwise use `<JIRA-ID>: Bump <package> to v<fixed> for <CVE-ID>`. Stage all changes and commit.
 
-```
-## CVE Analysis Report
+## 6. Create PR
 
-**CVE:** CVE-XXXX-XXXXX
-**Package:** <package-name>
-**Current version:** vX.Y.Z (VULNERABLE)
-**Fixed version:** vA.B.C
-**Risk level:** HIGH / LOW / NOT AFFECTED
-
-**govulncheck:** Symbol Results found / Package Results only / Clean
-**Dependency chain:** Direct / Transitive via <parent-package>
-
-**Recommendation:** Update immediately / Update as best practice / No action needed
-```
-
-If **NOT AFFECTED** → stop here.
-
-If **LOW RISK** → ask the user if they want to fix it anyway (recommended as
-best practice). If they say no, stop here.
-
-If **HIGH RISK** → proceed to Step 5 automatically.
-
-## Step 5: Categorize the fix type
-
-Determine what kind of fix is needed:
-
-| Package path pattern | Type | Fix method |
-|---------------------|------|------------|
-| No domain (e.g. `crypto/tls`, `net/http`) | **STDLIB** | Go toolchain update needed — CANNOT auto-fix. Tell the user they need to coordinate with the `openshift-golang-builder-container` team. Stop here. |
-| `golang.org/x/*` | **EXTENDED_STDLIB** | `go get golang.org/x/<pkg>@<fixed-version>` |
-| `github.com/...` or other domain | **THIRD_PARTY** | `go get <package>@<fixed-version>` |
-
-If **STDLIB** → report that this requires a Go toolchain update and stop.
-The user cannot fix this with a dependency bump.
-
-## Step 6: Apply the fix
-
-### 6a. Create a fix branch
-
-```bash
-git checkout -b fix-cve-<CVE-ID>-<branch-name>
-```
-
-### 6b. Bump the dependency
-
-```bash
-go get <package>@v<fixed-version>
-go mod tidy
-```
-
-If the repo uses vendoring:
-
-```bash
-go mod vendor
-```
-
-### 6c. Verify the fix
-
-```bash
-# Confirm the version is updated
-grep "<package-name>" go.mod
-
-# Re-run govulncheck to confirm the vulnerability is resolved
-govulncheck ./...
-
-# Run tests
-go test ./...
-```
-
-If tests fail, report the failure to the user and ask how to proceed.
-Do NOT create a PR with failing tests.
-
-### 6d. Commit the changes
-
-Determine the correct commit message format.
-
-Check if this is a vendored upstream repo by looking for `UPSTREAM` in
-recent commit messages:
-
-```bash
-git log --oneline -20 | head -5
-```
-
-If recent commits use `UPSTREAM:` prefix:
-
-```bash
-git add -A
-git commit -m "UPSTREAM: <carry>: Bump <package> to v<fixed> for <CVE-ID>"
-```
-
-Otherwise use a standard format:
-
-```bash
-git add -A
-git commit -m "<JIRA-ID>: Bump <package> to v<fixed> for <CVE-ID>"
-```
-
-## Step 7: Create the pull request
-
-```bash
-git push origin fix-cve-<CVE-ID>-<branch-name>
-
-gh pr create \
-  --title "<JIRA-ID>: Bump <package> to v<fixed> for <CVE-ID>" \
-  --body "$(cat <<'EOF'
-## CVE Fix
-
-**CVE:** <CVE-ID>
-**Package:** <package-name>
-**Previous version:** v<old-version> (vulnerable)
-**Fixed version:** v<fixed-version>
-
-## Analysis
-
-- **govulncheck result:** <Symbol Results / Package Results>
-- **Risk level:** <HIGH / LOW>
-- **Dependency type:** <Direct / Transitive>
-
-## Changes
-
-- Updated `<package>` from `v<old>` to `v<fixed>` in `go.mod`
-- Ran `go mod tidy` to update `go.sum`
-
-## Testing
-
-- [x] `govulncheck ./...` — clean (no vulnerability found)
-- [x] `go test ./...` — all tests pass
-
-## References
-
-- https://www.cve.org/CVERecord?id=<CVE-ID>
-- https://pkg.go.dev/vuln/<CVE-ID>
-EOF
-)"
-```
+Push the branch. Create a PR on the hosting platform. The PR body must include: CVE ID, package name, old version, fixed version, risk level, vulnerability scan result, what changed, test results, and links to cve.org and pkg.go.dev/vuln.
 
 Report the PR URL to the user.
 
-## Step 8: Summary
+## Errors
 
-After completing all steps, present a final summary:
-
-```
-## Done!
-
-**CVE:** CVE-XXXX-XXXXX
-**Risk:** HIGH / LOW
-**Fix:** Bumped <package> from v<old> to v<fixed>
-**PR:** <URL>
-**Tests:** All passing
-
-Next steps:
-- Review the PR
-- Merge when approved
-- Update the Jira ticket (if applicable)
-```
-
-## Error handling
-
-| Error | What to do |
-|-------|------------|
-| `govulncheck` not found | Run `go install golang.org/x/vuln/cmd/govulncheck@latest` |
-| Package not in `go.mod` | Report NOT AFFECTED and stop |
-| `go get` fails | Report the error and ask the user for help |
-| Tests fail after fix | Report failures, do NOT create PR, ask user |
-| `gh` not authenticated | Ask user to run `gh auth login` |
-| No fixed version available | Report that no fix exists yet and stop |
-| STDLIB vulnerability | Report that Go toolchain update is needed, stop |
+- Vulnerability scanner not found -> install it
+- CVE not in vulnerability database -> report invalid/unsupported CVE, stop
+- CVE not found in scan results -> NOT AFFECTED, stop
+- Dependency bump fails -> report error, ask user
+- Tests fail -> report, do NOT create PR, ask user
+- PR tool not authenticated -> ask user to authenticate
+- No fixed version available -> report, stop
+- STDLIB vulnerability -> report Go toolchain update needed, stop

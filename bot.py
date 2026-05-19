@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +59,25 @@ for entry in MANUAL_COMPONENT_MAP_STR.split(","):
         comp, repo = entry.split("=", 1)
         MANUAL_COMPONENT_MAP[comp.strip()] = (repo.strip(), "main")
 
+_ocp_build_data_cache: dict[str, str] = {}
+
+
+def _http_session() -> requests.Session:
+    """Return a requests session with automatic retries on transient errors."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_session = _http_session()
+
 
 @dataclass
 class CVETicket:
@@ -84,23 +105,64 @@ class AnalysisResult:
     error: str = ""
 
 
+@dataclass
+class OSVData:
+    """Pre-validated CVE data from the OSV API."""
+    go_vuln_id: str = ""
+    aliases: list = field(default_factory=list)
+    packages: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# OSV pre-validation
+# ---------------------------------------------------------------------------
+
+def osv_lookup_cve(cve_id: str) -> OSVData | None:
+    """Validate a CVE against the OSV database and extract package/version info.
+
+    Returns None if the CVE is not tracked.
+    """
+    try:
+        resp = _session.get(f"https://api.osv.dev/v1/vulns/{cve_id}", timeout=15)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        log.warning("OSV API lookup failed for %s: %s", cve_id, e)
+        return None
+
+    result = OSVData()
+    result.aliases = data.get("aliases", [])
+
+    for alias in result.aliases:
+        if alias.startswith("GO-"):
+            result.go_vuln_id = alias
+            break
+
+    for affected in data.get("affected", []):
+        pkg = affected.get("package", {})
+        if pkg.get("ecosystem") != "Go":
+            continue
+        pkg_name = pkg.get("name", "")
+        fixed_version = ""
+        for rng in affected.get("ranges", []):
+            for event in rng.get("events", []):
+                if "fixed" in event:
+                    v = event["fixed"]
+                    fixed_version = v if v.startswith("v") else f"v{v}"
+        if pkg_name:
+            result.packages.append({"name": pkg_name, "fixed": fixed_version})
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Jira helpers
 # ---------------------------------------------------------------------------
 
-def _jira_get(path: str) -> dict:
-    resp = requests.get(
-        f"{JIRA_URL}/rest/api/3/{path}",
-        auth=(JIRA_USER, JIRA_TOKEN),
-        headers={"Accept": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
 def _jira_search(jql: str, max_results: int = 50) -> list[dict]:
-    resp = requests.post(
+    resp = _session.post(
         f"{JIRA_URL}/rest/api/3/search/jql",
         json={"jql": jql, "fields": ["summary", "components", "labels", "status"], "maxResults": max_results},
         auth=(JIRA_USER, JIRA_TOKEN),
@@ -109,6 +171,20 @@ def _jira_search(jql: str, max_results: int = 50) -> list[dict]:
     )
     resp.raise_for_status()
     return resp.json().get("issues", [])
+
+
+def _text_to_adf(text: str) -> dict:
+    """Convert a multi-line plain text string into Jira ADF with one paragraph per line."""
+    paragraphs = []
+    for line in text.split("\n"):
+        if line:
+            paragraphs.append({
+                "type": "paragraph",
+                "content": [{"type": "text", "text": line}],
+            })
+        else:
+            paragraphs.append({"type": "paragraph", "content": []})
+    return {"type": "doc", "version": 1, "content": paragraphs}
 
 
 def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
@@ -178,20 +254,25 @@ def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
     grep_source = details.get("grep_source", "")
     lines.append(f"  $ grep -r \"{pkg_short}\" . --include=*.go -l")
     lines.append(f"  {grep_source or '(no output - no references found)'}")
-    if "not found" in grep_source.lower() or grep_source.startswith("(no"):
-        lines.append(f"  Findings:")
+    no_source_refs = "not found" in grep_source.lower() or grep_source.startswith("(no")
+    if no_source_refs:
+        lines.append("  Findings:")
         lines.append(f"  ✅ No import statements for {pkg_short}")
         lines.append(f"  ✅ No code references to {pkg_short} functionality")
     else:
-        lines.append(f"  Findings:")
+        lines.append("  Findings:")
         lines.append(f"  ⚠️ Source code references to {pkg_short} found in the files above")
 
     if risk == "NOT_AFFECTED":
         lines.append("")
         lines.append("Triple-Verification Consensus:")
-        lines.append(f"  Dependency check: {'✅' if gomod_absent else '⚠️'} {'No' if gomod_absent else 'Found'} {pkg_short} in go.mod/go.sum")
-        lines.append(f"  Code analysis: {'✅' if 'not found' in grep_source.lower() or grep_source.startswith('(no') else '⚠️'} {'No' if 'not found' in grep_source.lower() or grep_source.startswith('(no') else 'Found'} {pkg_short} imports or references")
-        lines.append(f"  govulncheck: ✅ Package is absent or not called")
+        dep_ok = "✅" if gomod_absent else "⚠️"
+        dep_word = "No" if gomod_absent else "Found"
+        code_ok = "✅" if no_source_refs else "⚠️"
+        code_word = "No" if no_source_refs else "Found"
+        lines.append(f"  Dependency check: {dep_ok} {dep_word} {pkg_short} in go.mod/go.sum")
+        lines.append(f"  Code analysis: {code_ok} {code_word} {pkg_short} imports or references")
+        lines.append("  govulncheck: ✅ Package is absent or not called")
 
     lines.append("")
     lines.append(f"Risk Classification: {risk} {risk_emoji}")
@@ -235,19 +316,31 @@ def _jira_add_comment(issue_key: str, body: str) -> None:
     if DRY_RUN:
         log.info("[DRY RUN] Would comment on %s: %s", issue_key, body[:100])
         return
-    requests.post(
+    resp = _session.post(
         f"{JIRA_URL}/rest/api/3/issue/{issue_key}/comment",
-        json={
-            "body": {
-                "type": "doc",
-                "version": 1,
-                "content": [{"type": "paragraph", "content": [{"type": "text", "text": body}]}],
-            }
-        },
+        json={"body": _text_to_adf(body)},
         auth=(JIRA_USER, JIRA_TOKEN),
         headers={"Accept": "application/json", "Content-Type": "application/json"},
         timeout=30,
     )
+    if resp.status_code >= 400:
+        log.warning("Failed to comment on %s: %s %s", issue_key, resp.status_code, resp.text[:200])
+
+
+def _jira_add_label(issue_key: str, label: str) -> None:
+    if DRY_RUN:
+        log.info("[DRY RUN] Would add label '%s' to %s", label, issue_key)
+        return
+    resp = _session.put(
+        f"{JIRA_URL}/rest/api/3/issue/{issue_key}",
+        json={"update": {"labels": [{"add": label}]}},
+        auth=(JIRA_USER, JIRA_TOKEN),
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        log.warning("Failed to add label '%s' to %s: %s %s",
+                     label, issue_key, resp.status_code, resp.text[:200])
 
 
 def fetch_new_cve_tickets() -> list[CVETicket]:
@@ -300,15 +393,32 @@ def _run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subproce
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=check, timeout=300)
 
 
-def map_component_to_repo(component: str, version: str, labels: list[str] | None = None) -> tuple[str, str]:
-    """Map a Jira component to a GitHub repo URL and branch.
+def _get_ocp_build_data(ocp_branch: str) -> str | None:
+    """Return path to a cached ocp-build-data clone for the given branch."""
+    if ocp_branch in _ocp_build_data_cache:
+        cached = _ocp_build_data_cache[ocp_branch]
+        if Path(cached).exists():
+            return cached
 
-    Uses the same approach as Jaspreet's analyze-cve:
-    1. Check manual COMPONENT_MAP
-    2. Extract pscomponent from labels (e.g. openshift4/ose-cluster-storage-rhel9-operator)
-    3. Look up in ocp-build-data delivery_component_mapping.yml
-    4. Read the image YAML to find the GitHub repo URL
-    """
+    tmpdir = tempfile.mkdtemp(prefix="ocp-build-data-")
+    result = _run(["git", "clone", "--depth=1", "--branch", ocp_branch,
+                   OCP_BUILD_DATA_REPO, tmpdir], check=False)
+    if result.returncode != 0:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return None
+    _ocp_build_data_cache[ocp_branch] = tmpdir
+    return tmpdir
+
+
+def cleanup_ocp_build_data_cache() -> None:
+    """Remove all cached ocp-build-data clones."""
+    for path in _ocp_build_data_cache.values():
+        shutil.rmtree(path, ignore_errors=True)
+    _ocp_build_data_cache.clear()
+
+
+def map_component_to_repo(component: str, version: str, labels: list[str] | None = None) -> tuple[str, str]:
+    """Map a Jira component to a GitHub repo URL and branch."""
     if component in MANUAL_COMPONENT_MAP:
         repo_url, default_branch = MANUAL_COMPONENT_MAP[component]
         ocp_version = version.replace("openshift-", "") if version else ""
@@ -325,10 +435,10 @@ def map_component_to_repo(component: str, version: str, labels: list[str] | None
     ocp_branch = version if version else "openshift-4.17"
     ocp_version = version.replace("openshift-", "") if version else "4.17"
 
-    tmpdir = tempfile.mkdtemp(prefix="ocp-build-data-")
     try:
-        _run(["git", "clone", "--depth=1", "--branch", ocp_branch,
-              OCP_BUILD_DATA_REPO, tmpdir], check=False)
+        tmpdir = _get_ocp_build_data(ocp_branch)
+        if not tmpdir:
+            return "", ""
 
         search_terms = [t for t in [pscomponent, component] if t]
 
@@ -369,8 +479,6 @@ def map_component_to_repo(component: str, version: str, labels: list[str] | None
                             return repo_url, f"release-{ocp_version}"
     except Exception as e:
         log.warning("ocp-build-data lookup failed: %s", e)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
     return "", ""
 
@@ -387,13 +495,7 @@ def _read_repo_from_image_yaml(path: Path) -> str:
 
 
 def _extract_repo_from_summary(summary: str, version: str) -> tuple[str, str]:
-    """Try to extract a GitHub org/repo from the ticket summary.
-
-    Handles multiple formats:
-      CVE-XXXX openshift-kni/commatrix: ...          → github.com/openshift-kni/commatrix
-      CVE-XXXX openshift4/cnf-tests-rhel8: ...       → skipped (container image, not a repo)
-      CVE-XXXX rhcos: ...                             → no repo
-    """
+    """Try to extract a GitHub org/repo from the ticket summary."""
     match = re.search(r"CVE-[\d-]+\s+([\w.-]+/[\w.-]+):", summary)
     if match:
         org_repo = match.group(1)
@@ -409,10 +511,7 @@ def _extract_repo_from_summary(summary: str, version: str) -> tuple[str, str]:
 
 
 def _extract_repo_from_labels(labels: list[str], version: str) -> tuple[str, str]:
-    """Try to extract a GitHub repo from pscomponent label.
-
-    Labels often include: pscomponent:openshift-kni/commatrix
-    """
+    """Try to extract a GitHub repo from pscomponent label."""
     for label in labels:
         if label.startswith("pscomponent:"):
             pscomp = label[len("pscomponent:"):]
@@ -429,30 +528,6 @@ def _extract_repo_from_labels(labels: list[str], version: str) -> tuple[str, str
 # CVE analysis
 # ---------------------------------------------------------------------------
 
-def _extract_cve_package(cve_id: str, summary: str) -> str:
-    """Try to extract the affected Go package from the CVE summary."""
-    known_patterns = {
-        "grpc": "google.golang.org/grpc",
-        "go-jose": "github.com/go-jose/go-jose",
-        "go jose": "github.com/go-jose/go-jose",
-        "golang.org/x/crypto": "golang.org/x/crypto",
-        "golang.org/x/net": "golang.org/x/net",
-        "golang.org/x/text": "golang.org/x/text",
-        "net/http": "net/http",
-        "crypto/tls": "crypto/tls",
-        "buildkit": "github.com/moby/buildkit",
-        "containerd": "github.com/containerd/containerd",
-        "runc": "github.com/opencontainers/runc",
-        "etcd": "go.etcd.io/etcd",
-        "prometheus": "github.com/prometheus/prometheus",
-    }
-    summary_lower = summary.lower()
-    for keyword, package in known_patterns.items():
-        if keyword.lower() in summary_lower:
-            return package
-    return ""
-
-
 @dataclass
 class DetailedAnalysis:
     risk_level: str = "UNKNOWN"
@@ -468,16 +543,108 @@ class DetailedAnalysis:
     other_vulns: list = field(default_factory=list)
 
 
-def analyze_repo(repo_dir: str, cve_id: str, package: str) -> tuple[str, str, str, str]:
-    """Run govulncheck and check if the repo is affected.
+def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | None) -> dict:
+    """Parse govulncheck JSON output and classify risk for the target CVE.
 
-    Returns (risk_level, current_version, govulncheck_output, fix_type).
+    Returns dict with keys: risk_level, package, current_version, fixed_version,
+    other_vulns, matched_vuln_summary.
+    """
+    target_ids = {cve_id.upper()}
+    if osv_data:
+        target_ids.update(a.upper() for a in osv_data.aliases)
+        if osv_data.go_vuln_id:
+            target_ids.add(osv_data.go_vuln_id.upper())
+
+    result = {
+        "risk_level": "NOT_AFFECTED",
+        "package": "",
+        "fixed_version": "",
+        "other_vulns": [],
+        "matched_vuln_summary": "",
+    }
+
+    osv_entries: dict[str, dict] = {}
+    findings: list[dict] = []
+
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if "osv" in obj:
+            entry = obj["osv"]
+            osv_entries[entry.get("id", "")] = entry
+        elif "finding" in obj:
+            findings.append(obj["finding"])
+
+    for finding in findings:
+        osv_id = finding.get("osv", "")
+        trace = finding.get("trace", [])
+
+        entry = osv_entries.get(osv_id, {})
+        aliases = [a.upper() for a in entry.get("aliases", [])]
+        all_ids = {osv_id.upper()} | set(aliases)
+
+        is_target = bool(all_ids & target_ids)
+        has_symbol_trace = any(t.get("function") for t in trace)
+
+        vuln_module = ""
+        for t in trace:
+            if t.get("module") and t["module"] != "stdlib":
+                vuln_module = t["module"]
+                break
+
+        if is_target:
+            result["package"] = vuln_module
+            result["risk_level"] = "HIGH" if has_symbol_trace else "LOW"
+
+            for affected in entry.get("affected", []):
+                pkg = affected.get("package", {})
+                if pkg.get("name", "") == vuln_module or not vuln_module:
+                    for rng in affected.get("ranges", []):
+                        for event in rng.get("events", []):
+                            if "fixed" in event:
+                                v = event["fixed"]
+                                result["fixed_version"] = v if v.startswith("v") else f"v{v}"
+
+            cve_ids = [a for a in entry.get("aliases", []) if a.startswith("CVE-")]
+            result["matched_vuln_summary"] = (
+                f"{osv_id} ({', '.join(cve_ids)}): "
+                f"{'Symbol-level call found' if has_symbol_trace else 'Package imported but not called'}"
+            )
+        else:
+            cve_ids = [a for a in entry.get("aliases", []) if a.startswith("CVE-")]
+            vuln_info = {"id": osv_id, "package": vuln_module, "cve_ids": cve_ids}
+            if vuln_info not in result["other_vulns"]:
+                result["other_vulns"].append(vuln_info)
+
+    return result
+
+
+def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None) -> tuple[str, str, str, str]:
+    """Run govulncheck in JSON mode and check if the repo is affected.
+
+    Returns (risk_level, current_version, details_json, fix_type).
     """
     gomod = Path(repo_dir) / "go.mod"
     if not gomod.exists():
         return "NOT_GO_PROJECT", "", "", ""
 
     gomod_content = gomod.read_text()
+
+    package = ""
+    if osv_data and osv_data.packages:
+        for pkg_info in osv_data.packages:
+            if pkg_info["name"] in gomod_content:
+                package = pkg_info["name"]
+                break
+        if not package:
+            package = osv_data.packages[0]["name"]
+
     details = DetailedAnalysis(package=package)
 
     go_ver_match = re.search(r"^go\s+([\d.]+)", gomod_content, re.MULTILINE)
@@ -513,34 +680,20 @@ def analyze_repo(repo_dir: str, cve_id: str, package: str) -> tuple[str, str, st
 
     _run(["go", "install", "golang.org/x/vuln/cmd/govulncheck@latest"], cwd=repo_dir, check=False)
 
-    result = _run(["govulncheck", "./..."], cwd=repo_dir, check=False)
-    output = result.stdout + result.stderr
-    details.govulncheck_output = output[:3000]
-    log.info("govulncheck output (first 500 chars): %s", output[:500])
+    result = _run(["govulncheck", "-json", "./..."], cwd=repo_dir, check=False)
+    raw_output = result.stdout
+    details.govulncheck_output = raw_output[:3000]
+    log.info("govulncheck JSON output length: %d chars", len(raw_output))
 
-    cve_found = cve_id.lower() in output.lower()
+    parsed = _parse_govulncheck_json(raw_output, cve_id, osv_data)
 
-    if "Symbol Results" in output:
-        details.risk_level = "HIGH"
-    elif "Package Results" in output:
-        details.risk_level = "LOW" if cve_found else "NOT_AFFECTED"
-    elif cve_found:
-        details.risk_level = "LOW"
-    else:
-        details.risk_level = "NOT_AFFECTED"
+    details.risk_level = parsed["risk_level"]
+    details.other_vulns = parsed["other_vulns"]
 
-    for m in re.finditer(r"(GO-\d{4}-\d+)\s*(?:\(([^)]+)\))?\s*", output):
-        vuln_id = m.group(1)
-        vuln_pkg = m.group(2) or ""
-        if vuln_id not in str(details.other_vulns):
-            details.other_vulns.append({"id": vuln_id, "package": vuln_pkg})
-
-    if not package and cve_found:
-        pkg_match = re.search(r"Module:\s+(\S+)", output)
-        if pkg_match:
-            package = pkg_match.group(1)
-            details.package = package
-            log.info("Auto-detected package from govulncheck: %s", package)
+    if parsed["package"]:
+        details.package = parsed["package"]
+        package = parsed["package"]
+        if not details.current_version:
             version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
             details.current_version = version_match.group(1) if version_match else "unknown"
 
@@ -581,15 +734,15 @@ def _store_details(repo_dir: str, details: DetailedAnalysis) -> None:
         pass
 
 
-def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str) -> str:
-    """Look up the fixed version for a CVE from multiple sources.
+def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str,
+                          osv_data: OSVData | None) -> str:
+    """Look up the fixed version from OSV data, govulncheck output, or vuln.go.dev."""
+    if osv_data:
+        for pkg_info in osv_data.packages:
+            if pkg_info["name"] == package and pkg_info["fixed"]:
+                log.info("Fixed version from OSV data: %s", pkg_info["fixed"])
+                return pkg_info["fixed"]
 
-    Tries in order:
-    1. govulncheck output (most reliable)
-    2. Go vulnerability database API (vuln.go.dev)
-    3. Package proxy API (proxy.golang.org)
-    """
-    # Method 1: Extract from govulncheck output
     for pattern in [
         r"Fixed in:\s*(v[\d.]+[\w.-]*)",
         r"Fixed in:\s*\S+@(v[\d.]+[\w.-]*)",
@@ -601,15 +754,15 @@ def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str) -> st
             log.info("Fixed version from govulncheck: %s", version)
             return version
 
-    # Method 2: Go vulnerability database API
     try:
-        go_vuln_id = ""
-        id_match = re.search(r"(GO-\d{4}-\d+)", govulncheck_out)
-        if id_match:
-            go_vuln_id = id_match.group(1)
+        go_vuln_id = osv_data.go_vuln_id if osv_data else ""
+        if not go_vuln_id:
+            id_match = re.search(r"(GO-\d{4}-\d+)", govulncheck_out)
+            if id_match:
+                go_vuln_id = id_match.group(1)
 
         if go_vuln_id:
-            resp = requests.get(f"https://vuln.go.dev/ID/{go_vuln_id}.json", timeout=10)
+            resp = _session.get(f"https://vuln.go.dev/ID/{go_vuln_id}.json", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 for affected in data.get("affected", []):
@@ -624,10 +777,9 @@ def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str) -> st
     except Exception as e:
         log.debug("vuln.go.dev lookup failed: %s", e)
 
-    # Method 3: Check latest version from Go proxy
     if package and "/" in package:
         try:
-            resp = requests.get(f"https://proxy.golang.org/{package}/@latest", timeout=10)
+            resp = _session.get(f"https://proxy.golang.org/{package}/@latest", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 version = data.get("Version", "")
@@ -642,7 +794,7 @@ def _lookup_fixed_version(cve_id: str, package: str, govulncheck_out: str) -> st
 
 def apply_fix(repo_dir: str, package: str, fixed_version: str) -> bool:
     """Bump the dependency and run go mod tidy. Returns True on success."""
-    target = f"{package}@{fixed_version}" if not fixed_version.startswith("v") else f"{package}@{fixed_version}"
+    target = f"{package}@{fixed_version}"
 
     result = _run(["go", "get", target], cwd=repo_dir, check=False)
     if result.returncode != 0:
@@ -671,21 +823,43 @@ def run_tests(repo_dir: str) -> tuple[bool, str]:
     return result.returncode == 0, output[:2000]
 
 
+def _check_existing_pr(branch_name: str, target_repo: str) -> str:
+    """Check if a PR already exists for this branch. Returns the URL or empty string."""
+    result = _run(
+        ["gh", "pr", "list", "--head", branch_name, "--repo", target_repo,
+         "--json", "url", "--limit", "1"],
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        try:
+            prs = json.loads(result.stdout)
+            if prs:
+                return prs[0].get("url", "")
+        except json.JSONDecodeError:
+            pass
+    return ""
+
+
 def create_pr(repo_dir: str, ticket: CVETicket, package: str,
               old_version: str, fixed_version: str, risk: str,
               repo_url: str = "") -> str:
     """Create a branch, commit, push, and open a PR. Returns the PR URL."""
     branch_name = f"fix-{ticket.cve_id.lower()}-{ticket.version}"
+    target_repo = repo_url.replace("https://github.com/", "") if repo_url else ""
+
+    if target_repo and not DRY_RUN:
+        existing = _check_existing_pr(branch_name, target_repo)
+        if existing:
+            log.info("PR already exists for branch %s: %s", branch_name, existing)
+            return existing
 
     _run(["git", "config", "user.email", "cve-bot@redhat.com"], cwd=repo_dir, check=False)
     _run(["git", "config", "user.name", "CVE Bot"], cwd=repo_dir, check=False)
 
-    _run(["git", "checkout", "-b", branch_name], cwd=repo_dir)
+    _run(["git", "checkout", "-b", branch_name], cwd=repo_dir, check=False)
 
-    is_upstream = False
     log_result = _run(["git", "log", "--oneline", "-10"], cwd=repo_dir, check=False)
-    if "UPSTREAM:" in log_result.stdout:
-        is_upstream = True
+    is_upstream = "UPSTREAM:" in log_result.stdout
 
     _run(["git", "add", "-A"], cwd=repo_dir)
 
@@ -694,7 +868,7 @@ def create_pr(repo_dir: str, ticket: CVETicket, package: str,
     else:
         msg = f"{ticket.key}: Bump {package} to {fixed_version} for {ticket.cve_id}"
 
-    _run(["git", "commit", "-m", msg], cwd=repo_dir)
+    _run(["git", "commit", "-m", msg], cwd=repo_dir, check=False)
 
     if DRY_RUN:
         log.info("[DRY RUN] Would push branch %s and create PR", branch_name)
@@ -746,7 +920,6 @@ def create_pr(repo_dir: str, ticket: CVETicket, package: str,
 - https://www.cve.org/CVERecord?id={ticket.cve_id}
 """
 
-    target_repo = repo_url.replace("https://github.com/", "") if repo_url else ""
     if is_fork_needed:
         head_ref = f"{gh_user}:{branch_name}"
     else:
@@ -779,7 +952,23 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     result = AnalysisResult(ticket=ticket)
     log.info("Processing %s: %s", ticket.key, ticket.cve_id)
 
-    # Map component to repo (try multiple methods in order)
+    osv_data = osv_lookup_cve(ticket.cve_id)
+    if osv_data is None:
+        result.error = f"{ticket.cve_id} is not tracked in the Go vulnerability database"
+        log.warning(result.error)
+        _jira_add_comment(ticket.key, f"CVE Bot: {result.error}. No action taken.")
+        _jira_add_label(ticket.key, "cve-bot-processed")
+        return result
+    if not osv_data.packages:
+        result.error = f"{ticket.cve_id} has no Go packages listed in OSV — may not be a Go vulnerability"
+        log.warning(result.error)
+        _jira_add_comment(ticket.key, f"CVE Bot: {result.error}. No action taken.")
+        _jira_add_label(ticket.key, "cve-bot-processed")
+        return result
+    log.info("OSV pre-validation: %s → %s, packages: %s",
+             ticket.cve_id, osv_data.go_vuln_id,
+             [p["name"] for p in osv_data.packages])
+
     repo_url, branch = map_component_to_repo(ticket.component, ticket.version, ticket.labels)
     if not repo_url:
         repo_url, branch = _extract_repo_from_summary(ticket.summary, ticket.version)
@@ -793,7 +982,6 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
     result.branch = branch
     log.info("Mapped to %s branch %s", repo_url, branch)
 
-    # Clone the repo (inject token for push access)
     tmpdir = tempfile.mkdtemp(prefix="cve-fix-")
     try:
         auth_repo_url = repo_url
@@ -816,27 +1004,24 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
                 log.warning(result.error)
                 return result
 
-        # Try to identify the package from the summary first
-        package = _extract_cve_package(ticket.cve_id, ticket.summary)
-        if not package:
-            log.info("Could not extract package from summary, running govulncheck to detect automatically")
-
-        # Analyze (govulncheck runs on the whole repo regardless)
-        risk, current_ver, govulncheck_out, fix_type = analyze_repo(tmpdir, ticket.cve_id, package)
+        risk, current_ver, govulncheck_out, fix_type = analyze_repo(tmpdir, ticket.cve_id, osv_data)
         result.risk_level = risk
         result.current_version = current_ver
         result.govulncheck_output = govulncheck_out
         result.fix_type = fix_type
 
-        pkg_match = re.search(r"Auto-detected package.*?:\s*(\S+)", govulncheck_out)
-        if not package and "Module:" in govulncheck_out:
-            mod_match = re.search(r"Module:\s+(\S+)", govulncheck_out)
-            if mod_match:
-                package = mod_match.group(1)
+        package = ""
+        try:
+            details_dict = json.loads(govulncheck_out)
+            package = details_dict.get("package", "")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if not package and osv_data.packages:
+            package = osv_data.packages[0]["name"]
         result.package = package
         log.info("Risk: %s, Fix type: %s, Package: %s, Current: %s", risk, fix_type, package, current_ver)
 
-        if risk == "NOT_AFFECTED" or risk == "NOT_GO_PROJECT":
+        if risk in ("NOT_AFFECTED", "NOT_GO_PROJECT"):
             log.info("Not affected, skipping")
             try:
                 details = json.loads(govulncheck_out)
@@ -844,14 +1029,24 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
                 details = {}
             comment = _build_detailed_comment(ticket, repo_url, branch, package, risk, details)
             _jira_add_comment(ticket.key, comment)
+            _jira_add_label(ticket.key, "cve-bot-processed")
             return result
 
         if fix_type == "STDLIB":
             result.error = "STDLIB vulnerability — requires Go toolchain update, cannot auto-fix"
             log.warning(result.error)
+            comment = (
+                f"CVE Bot Analysis for {ticket.cve_id}:\n"
+                f"Risk: {risk}\n"
+                f"Package: {package}\n\n"
+                f"This is a standard library (STDLIB) vulnerability that requires a Go toolchain update.\n"
+                f"Cannot auto-fix — please coordinate with the openshift-golang-builder-container team."
+            )
+            _jira_add_comment(ticket.key, comment)
+            _jira_add_label(ticket.key, "cve-bot-processed")
             return result
 
-        fixed_version = _lookup_fixed_version(ticket.cve_id, package, govulncheck_out)
+        fixed_version = _lookup_fixed_version(ticket.cve_id, package, govulncheck_out, osv_data)
         result.fixed_version = fixed_version
         log.info("Fixed version: %s", fixed_version or "(not found)")
 
@@ -860,12 +1055,10 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             log.warning(result.error)
             return result
 
-        # Apply fix
         if not apply_fix(tmpdir, package, fixed_version):
             result.error = "Failed to apply fix (go get or go mod tidy failed)"
             return result
 
-        # Run tests
         log.info("Running go test ./...")
         tests_passed, test_output = run_tests(tmpdir)
         if not tests_passed:
@@ -874,11 +1067,9 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             return result
         log.info("Tests passed ✓")
 
-        # Create PR
         pr_url = create_pr(tmpdir, ticket, package, current_ver, fixed_version, risk, repo_url)
         result.pr_url = pr_url
 
-        # Comment on Jira
         if pr_url and not pr_url.startswith("[DRY RUN]"):
             comment = (
                 f"CVE Bot Analysis:\n"
@@ -887,6 +1078,8 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
                 f"- PR: {pr_url}\n"
             )
             _jira_add_comment(ticket.key, comment)
+
+        _jira_add_label(ticket.key, "cve-bot-processed")
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -914,20 +1107,22 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     results = []
 
-    for ticket in tickets:
-        result = process_ticket(ticket)
-        results.append(result)
+    try:
+        for ticket in tickets:
+            result = process_ticket(ticket)
+            results.append(result)
 
-        status = "PR_CREATED" if result.pr_url else result.risk_level
-        if result.error:
-            status = f"ERROR: {result.error[:80]}"
-        log.info(
-            "%s | %s | %s | %s",
-            ticket.key, ticket.cve_id, status,
-            result.pr_url or "no PR",
-        )
+            status = "PR_CREATED" if result.pr_url else result.risk_level
+            if result.error:
+                status = f"ERROR: {result.error[:80]}"
+            log.info(
+                "%s | %s | %s | %s",
+                ticket.key, ticket.cve_id, status,
+                result.pr_url or "no PR",
+            )
+    finally:
+        cleanup_ocp_build_data_cache()
 
-    # Write summary
     summary = {
         "total_tickets": len(tickets),
         "results": [
@@ -946,7 +1141,6 @@ def main():
     summary_file.write_text(json.dumps(summary, indent=2))
     log.info("Summary written to %s", summary_file)
 
-    # Print summary table
     print("\n" + "=" * 70)
     print("CVE Bot Summary")
     print("=" * 70)
