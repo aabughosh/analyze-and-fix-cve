@@ -8,10 +8,10 @@ an **AI skill** for Cursor/Claude Code (interactive use).
 
 Given a CVE and a Go repository, it performs the full analysis and fix pipeline:
 
-1. **Find CVE tickets** — queries Jira for new unresolved CVE tickets assigned to your team
-2. **Find the repo** — maps the Jira component to a GitHub repository automatically (via ocp-build-data, ticket summary, or pscomponent label)
-3. **Check dependencies** — searches `go.mod` and `go.sum` for the vulnerable package
-4. **Run `govulncheck`** — symbol-level analysis to determine if your code **actually calls** the vulnerable functions (not just whether the dependency exists)
+1. **Validate the CVE** — calls the OSV API to confirm the CVE is tracked in the Go vulnerability database and retrieves the affected package, aliases, and fixed version upfront
+2. **Find CVE tickets** (bot mode) — queries Jira for new unresolved CVE tickets assigned to your team
+3. **Find the repo** — maps the Jira component to a GitHub repository automatically (via ocp-build-data, ticket summary, or pscomponent label)
+4. **Run `govulncheck -json`** — symbol-level analysis in JSON mode, matching the specific CVE by its OSV aliases to determine if your code **actually calls** the vulnerable functions
 5. **Classify the risk:**
    - **HIGH** — code calls vulnerable functions → fix immediately
    - **LOW** — dependency exists but vulnerable functions are not called → fix as best practice
@@ -20,11 +20,10 @@ Given a CVE and a Go repository, it performs the full analysis and fix pipeline:
    - **THIRD_PARTY** (e.g. `github.com/go-jose/go-jose`) → auto-fix by bumping dependency
    - **EXTENDED_STDLIB** (e.g. `golang.org/x/net`) → auto-fix by bumping dependency
    - **STDLIB** (e.g. `crypto/tls`) → cannot auto-fix, requires Go toolchain update from another team
-7. **Find the fixed version** — looks up the fix version from govulncheck output, the Go vulnerability database (vuln.go.dev), or the Go module proxy
-8. **Apply the fix** — runs `go get package@fixed-version` and `go mod tidy` to bump the dependency
-9. **Run tests** — runs `go test ./...` to make sure the fix does not break anything. If tests fail, the bot **stops and does not create a PR**
-10. **Create a PR** — pushes a branch and opens a pull request with full CVE details, analysis evidence, and test results. For repos you do not own, it forks the repo first
-11. **Post to Jira** — comments on the Jira ticket with a detailed analysis report including triple-verification evidence (govulncheck + dependency check + source code analysis)
+7. **Apply the fix** — runs `go get package@fixed-version` and `go mod tidy` to bump the dependency
+8. **Run tests** — runs `go test ./...` to make sure the fix does not break anything. If tests fail, the bot **stops and does not create a PR**
+9. **Create a PR** — checks for existing PRs to avoid duplicates, then pushes a branch and opens a pull request. For repos you do not own, it forks the repo first
+10. **Post to Jira** — comments on the Jira ticket with a detailed analysis report and labels the ticket `cve-bot-processed` to prevent re-processing
 
 ## Quick start
 
@@ -70,32 +69,29 @@ Is ptp-operator vulnerable to CVE-2026-34986?
 ## Prerequisites
 
 - **Go 1.20+** installed
-- **`gh` CLI** installed and authenticated (`gh auth login`)
+- A way to create PRs on the hosting platform (e.g. `gh` CLI authenticated)
 - The target repo must have a **`go.mod`** file (Go projects only)
 - `govulncheck` is installed automatically if missing
 
 ## How it works
 
 ```
-Jira ticket: OCPBUGS-84945 (CVE-2026-4441)
+CVE-2026-4441
      │
      ▼
-Find repo → extract "aabughosh/cve-bot-test" from ticket summary
+Validate via OSV API → confirms CVE exists, gets package + aliases + fixed version
+     │
+     ▼
+Find repo → ocp-build-data / ticket summary / pscomponent label
      │
      ▼
 Clone repo → fallback to main if release branch does not exist
      │
      ▼
-Check go.mod → golang.org/x/net v0.23.0 (VULNERABLE)
-     │
-     ▼
-Run govulncheck → Symbol Results: main.go calls html.Parse → HIGH RISK
+Run govulncheck -json → match target CVE by aliases → HIGH RISK (symbol call found)
      │
      ▼
 Categorize → EXTENDED_STDLIB → can auto-fix
-     │
-     ▼
-Find fixed version → govulncheck says v0.45.0
      │
      ▼
 Apply fix → go get golang.org/x/net@v0.45.0 && go mod tidy
@@ -104,18 +100,18 @@ Apply fix → go get golang.org/x/net@v0.45.0 && go mod tidy
 Run tests → go test ./... → all pass ✓
      │
      ▼
-Create PR → https://github.com/aabughosh/cve-bot-test/pull/1
+Check for duplicate PRs → none found → create PR
      │
      ▼
-Comment on Jira → detailed analysis with triple-verification evidence
+Comment on Jira + label cve-bot-processed
 ```
 
 ## Risk levels
 
 | Level | What it means | Action |
 |-------|---------------|--------|
-| **HIGH** | Code calls vulnerable functions (`govulncheck` Symbol Results) | Fix immediately, PR created automatically |
-| **LOW** | Dependency exists but not called (`govulncheck` Package Results) | Asks you — recommended to fix as best practice |
+| **HIGH** | Code calls vulnerable functions (govulncheck symbol trace) | Fix immediately, PR created automatically |
+| **LOW** | Dependency exists but not called (govulncheck finding without symbol trace) | Asks you — recommended to fix as best practice |
 | **NOT AFFECTED** | Package not in repo or already fixed | Reports clean, stops |
 
 ## Fix types
@@ -124,25 +120,26 @@ Comment on Jira → detailed analysis with triple-verification evidence
 |------|---------|---------------|
 | **THIRD_PARTY** | `github.com/go-jose/go-jose/v4` | Yes — bumps dependency |
 | **EXTENDED_STDLIB** | `golang.org/x/crypto` | Yes — bumps dependency |
-| **STDLIB** | `crypto/tls`, `net/http` | No — requires Go toolchain update, reports and stops |
+| **STDLIB** | `crypto/tls`, `net/http` | No — requires Go toolchain update, reports to Jira and stops |
 
 ## Bot mode (automated)
 
 The bot runs as a GitHub Action on a schedule (every weekday at 8am UTC).
 No human intervention needed. It handles everything end-to-end:
 
-1. **Fetch new tickets** — queries Jira for unresolved CVE tickets assigned to your team's components
-2. **Find the repo** — maps the Jira ticket to a GitHub repository using ocp-build-data, the ticket summary (`org/repo`), or the pscomponent label
-3. **Clone and analyze** — clones the repo, runs `govulncheck ./...` for symbol-level vulnerability analysis
-4. **Check dependencies** — verifies if the vulnerable package is in `go.mod`, `go.sum`, and source code (triple-verification)
+1. **Fetch new tickets** — queries Jira for unresolved CVE tickets assigned to your team's components (skips tickets already labeled `cve-bot-processed`)
+2. **Pre-validate via OSV** — calls `api.osv.dev` to confirm the CVE is tracked, get the affected Go package, fixed version, and vulnerability aliases. Skips early if the CVE is not in the database
+3. **Find the repo** — maps the Jira ticket to a GitHub repository using ocp-build-data (cached per OCP version), the ticket summary (`org/repo`), or the pscomponent label
+4. **Clone and analyze** — clones the repo, runs `govulncheck -json ./...` and matches findings to the target CVE by its aliases for accurate per-CVE risk classification
 5. **Classify risk** — HIGH (code calls vulnerable functions), LOW (dependency present but not called), or NOT AFFECTED
-6. **Find fixed version** — looks up the fix version from govulncheck, vuln.go.dev, or proxy.golang.org
-7. **Apply fix** — bumps the dependency (`go get package@fixed-version && go mod tidy`)
-8. **Run tests** — runs `go test ./...` to verify the fix does not break anything. **If tests fail, the bot stops and does not create a PR**
-9. **Create PR** — pushes a fix branch and opens a pull request with CVE details, analysis, and test results. For repos you do not own, it **forks the repo first** and creates the PR from your fork
-10. **Post to Jira** — comments on the Jira ticket with a detailed analysis report and the PR link
+6. **Apply fix** — bumps the dependency (`go get package@fixed-version && go mod tidy`)
+7. **Run tests** — runs `go test ./...` to verify the fix does not break anything. **If tests fail, the bot stops and does not create a PR**
+8. **Create PR** — checks for existing PRs to avoid duplicates, then pushes a fix branch and opens a pull request. For repos you do not own, it **forks the repo first**
+9. **Post to Jira** — comments on the Jira ticket with a detailed analysis report and labels the ticket `cve-bot-processed`
 
-If a CVE is **NOT AFFECTED**, the bot posts a detailed comment on Jira explaining why (with evidence) and moves on. No PR is created.
+If a CVE is **NOT AFFECTED**, the bot posts a detailed comment on Jira explaining why (with evidence), labels the ticket, and moves on. No PR is created.
+
+If a CVE is **STDLIB**, the bot posts a comment explaining that a Go toolchain update is needed and labels the ticket. No PR is created.
 
 ### Setup
 
