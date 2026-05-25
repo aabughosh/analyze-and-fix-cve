@@ -107,33 +107,66 @@ You give it a CVE → it gives you a PR
 | **EXTENDED_STDLIB** | `golang.org/x/net`, `golang.org/x/crypto` | Yes — bumps the dependency |
 | **STDLIB** | `crypto/tls`, `net/http` | No — needs a Go toolchain update |
 
-- **THIRD_PARTY** and **EXTENDED_STDLIB**: the tool runs `go get package@fixed-version`, `go mod tidy`, tests, and creates a PR
-- **STDLIB**: these packages are built into Go itself. Fixing them means updating the Go compiler version, which is managed by the `openshift-golang-builder-container` team. The tool **cannot auto-fix this** — instead it posts a Jira comment explaining what's needed and stops.
+**When it CAN fix (THIRD_PARTY / EXTENDED_STDLIB):**
+- Looks up the fixed version, runs `go get package@fixed-version`, `go mod tidy`, tests, and creates a PR
 
-> Speaker notes: This distinction matters because about 30-40% of Go CVEs are in the standard library. When we see a stdlib vulnerability like crypto/tls or net/http, there's nothing we can do in our repo — the fix has to come from the team that builds the Go toolchain image. The tool recognizes this automatically and reports it to Jira so the right team gets notified, instead of silently skipping it.
+**When it CAN'T fix (STDLIB):**
+- Packages like `crypto/tls` or `net/http` are built into the Go compiler itself
+- You can't bump them in go.mod — the fix requires updating the Go toolchain version
+- That's managed by a different team (`openshift-golang-builder-container`)
+- The tool **posts a Jira comment** explaining this: risk level, which stdlib package is affected, and that a Go toolchain update is needed
+- It labels the ticket so it's not forgotten — the right team can pick it up
+
+> Speaker notes: This distinction matters because a significant chunk of Go CVEs are in the standard library. When we see a stdlib vulnerability like crypto/tls or net/http, there's nothing we can do in our repo — the fix has to come from the team that builds the Go toolchain image. Without the tool, these often get silently skipped or sit for weeks because nobody knows what to do with them. Now the tool recognizes it automatically, reports the details to Jira, and makes it visible.
 
 ---
 
-## Slide 7: What Happens When It Finds a Vulnerability
+## Slide 7: Example — Fixable Vulnerability (EXTENDED_STDLIB)
 
-**Example: golang.org/x/net in cve-bot-test repo**
+**CVE-2026-4441 — golang.org/x/net in cve-bot-test repo**
 
-1. Jira ticket says: CVE-2026-4441 — vulnerability in `golang.org/x/net`
+1. Jira ticket says: vulnerability in `golang.org/x/net`
 2. Tool clones the repo, finds `golang.org/x/net v0.23.0` in go.mod
 3. Runs govulncheck → finds `main.go` calls `golang.org/x/net/html.Parse` → **HIGH risk**
-4. Bumps `golang.org/x/net` from `v0.23.0` to `v0.33.0` (the fixed version)
-5. Runs `go mod tidy`
-6. Runs `go test ./...` → all tests pass
-7. Creates PR: "Bump golang.org/x/net to v0.33.0 for CVE-2026-4441"
-8. Comments on Jira with the full analysis
+4. Looks up the fixed version → bumps from `v0.23.0` to `v0.33.0`
+5. Runs tests → all pass
+6. Creates PR, comments on Jira
 
-**Before:** 45 minutes of manual work. **After:** 3 minutes, no human involved.
+**Where does the fixed version come from?** The tool checks multiple sources in order:
+1. OSV database (has the exact fix version per package)
+2. govulncheck output (includes `fixed_version` in JSON findings)
+3. vuln.go.dev (Go's official vulnerability page)
+4. proxy.golang.org (latest version as a last resort)
 
-> Speaker notes: This is a real example from our test repo. The tool found that main.go directly calls the vulnerable Parse function in golang.org/x/net/html, classified it as HIGH, bumped the dependency, ran tests, and created the PR — all automatically.
+**Before:** 45 minutes. **After:** 3 minutes, no human involved.
+
+> Speaker notes: This is a real example from our test repo. The tool found that main.go directly calls the vulnerable Parse function in golang.org/x/net/html, classified it as HIGH, and fixed it end to end. For the fix version, it tries the most precise source first — OSV gives you the exact minimum fix version. If that's not available, it falls back to govulncheck's own data, then vuln.go.dev, and as a last resort it grabs the latest version from the Go module proxy.
 
 ---
 
-## Slide 8: What It Posts to Jira
+## Slide 8: Example — STDLIB Vulnerability (Can't Auto-Fix)
+
+**What happens when bumping a dependency isn't enough?**
+
+Example: CVE in `crypto/tls` (part of Go's standard library)
+
+1. Tool clones the repo, runs govulncheck → detects the vulnerability
+2. Classifies the package: `crypto/tls` has no domain → **STDLIB**
+3. The tool **cannot fix this** — `crypto/tls` is compiled into the Go binary, not a go.mod dependency
+4. Instead, the tool posts a Jira comment:
+   - Risk level: HIGH
+   - Package: `crypto/tls`
+   - "This is a standard library vulnerability that requires a Go toolchain update"
+   - "Please coordinate with the `openshift-golang-builder-container` team"
+5. Labels the ticket `cve-bot-processed`
+
+**The tool doesn't silently skip it — it makes the problem visible and tells you who can fix it.**
+
+> Speaker notes: This is an important case because without the tool, stdlib CVEs often just sit there. Nobody knows what to do with them, or they get triaged like a regular dependency bump and someone wastes time trying to fix it before realizing it's a toolchain issue. The tool catches this immediately, posts a clear explanation to Jira, and points to the right team. That way nothing falls through the cracks.
+
+---
+
+## Slide 9: What It Posts to Jira
 
 **Every ticket gets a detailed comment**
 
@@ -153,7 +186,7 @@ For NOT AFFECTED repos:
 
 ---
 
-## Slide 9: Safety — What Prevents Bad PRs
+## Slide 10: Safety — What Prevents Bad PRs
 
 **Built-in guardrails**
 
@@ -166,7 +199,7 @@ For NOT AFFECTED repos:
 
 ---
 
-## Slide 10: Setup — What You Need
+## Slide 11: Setup — What You Need
 
 **Bot mode (3 secrets + 2 variables)**
 
@@ -191,7 +224,7 @@ Check if this repo is affected by CVE-2026-34986
 
 ---
 
-## Slide 11: Results
+## Slide 12: Results
 
 **What this saves**
 
@@ -209,7 +242,7 @@ Check if this repo is affected by CVE-2026-34986
 
 ---
 
-## Slide 12: Demo / Try It
+## Slide 13: Demo / Try It
 
 **Try it yourself**
 
