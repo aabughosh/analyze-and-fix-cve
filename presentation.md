@@ -121,33 +121,58 @@ You give it a CVE → it gives you a PR
 
 ---
 
-## Slide 7: Example — Fixable Vulnerability (EXTENDED_STDLIB)
+## Slide 7: Real Example — What the Tool Actually Runs
 
 **CVE-2026-4441 — golang.org/x/net in cve-bot-test repo**
 
-1. Jira ticket says: vulnerability in `golang.org/x/net`
-2. Tool clones the repo, finds `golang.org/x/net v0.23.0` in go.mod
-3. Runs govulncheck → finds `main.go` calls `golang.org/x/net/html.Parse` → **HIGH risk**
-4. Looks up the fixed version → bumps from `v0.23.0` to `v0.33.0`
-5. Runs tests → all pass
-6. Creates PR, comments on Jira
+**Step 1: Clone and check go.mod**
+```
+$ git clone https://github.com/aabughosh/cve-bot-test
+$ cat go.mod
+module github.com/aabughosh/cve-bot-test
+go 1.24.10
+require golang.org/x/net v0.23.0      <-- vulnerable version
+```
 
-**Where does the fixed version come from?** The tool checks multiple sources in order:
+**Step 2: Run govulncheck**
+```
+$ govulncheck -json ./...
+```
+Output (455K of JSON). The key part — a **finding with a symbol trace**:
+```json
+{
+  "finding": {
+    "osv": "GO-2024-3333",
+    "fixed_version": "v0.33.0",
+    "trace": [
+      { "module": "golang.org/x/net", "function": "Parse" },
+      { "module": "cve-bot-test",     "function": "main" }
+    ]
+  }
+}
+```
+→ `main()` calls `html.Parse()` = your code calls the vulnerable function = **HIGH risk**
+→ `fixed_version: v0.33.0` = that's the version we need to bump to
 
-| # | Source | What it returns | Example (GO-2024-3333) |
-|---|--------|----------------|----------------------|
-| 1 | **OSV database** (`api.osv.dev`) | Exact fix version per package | Aliases: `GO-2024-3333` |
-| 2 | **govulncheck output** | `fixed_version` field in JSON findings | `"fixed_version": "v0.33.0"` |
-| 3 | **vuln.go.dev** | Official Go vulnerability page | Fixed: `0.33.0` for `golang.org/x/net` |
-| 4 | **proxy.golang.org** | Latest version (last resort) | `v0.55.0` (latest, not minimum fix) |
+**Step 3: Fix**
+```
+$ go get golang.org/x/net@v0.33.0
+$ go mod tidy
+```
 
-Sources 2 and 3 give you **v0.33.0** — the minimum version that fixes the vulnerability.
-Source 4 gives you **v0.55.0** — the latest release, which also fixes it but bumps much further than needed.
-The tool tries the precise sources first and only falls back to proxy.golang.org as a last resort.
+**Step 4: Test**
+```
+$ go test ./...
+ok   github.com/aabughosh/cve-bot-test   0.003s
+```
 
-**Before:** 45 minutes. **After:** 3 minutes, no human involved.
+**Step 5: Create PR**
+```
+$ git push origin fix-cve-CVE-2026-4441
+$ gh pr create --title "Bump golang.org/x/net to v0.33.0 for CVE-2026-4441"
+```
 
-> Speaker notes: This is a real example from our test repo. The tool found that main.go directly calls the vulnerable Parse function in golang.org/x/net/html, classified it as HIGH, and fixed it end to end. The fixed version lookup is important to understand — the tool prefers the most precise source. govulncheck's JSON output now includes a fixed_version field directly in each finding, so in most cases the answer is right there in the scan results. vuln.go.dev is the backup. proxy.golang.org is the last resort — it gives you the latest version which always includes the fix, but might bump you further than necessary. In this example, the minimum fix is v0.33.0 but the latest version is v0.55.0.
+> Speaker notes: This is a real example. The tool clones the repo, runs govulncheck in JSON mode, and parses the output. The finding tells us two things: first, it has a function in the trace — meaning our code actually calls the vulnerable function, so it's HIGH risk. Second, the fixed_version field tells us exactly which version to bump to. Then it's just go get, go mod tidy, run tests, and create a PR. The whole thing takes about 3 minutes.
 
 ---
 
