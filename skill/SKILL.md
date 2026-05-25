@@ -26,28 +26,32 @@ Ask the user for anything missing:
 
 If the repository is a remote URL, clone it (with the target branch) into a temporary directory inside the current working directory (to satisfy sandbox restrictions). Delete this directory when done. If it's a local path, work in that directory directly. Confirm `go.mod` exists before proceeding.
 
-## 2. Validate the CVE
+## 2. Validate the CVE (optional enrichment)
 
-Using only the scanner's own database:
+Try the scanner's own database to get package info and aliases:
 
-1. Verify the CVE ID exists and is tracked. If not recognized -> report that the CVE is not in the database and stop.
-2. Learn how the scanner identifies vulnerabilities in its output (it may use its own ID scheme, not CVE IDs). Note the scanner's ID for the target CVE.
-3. Learn what fields the scanner reports so you know what to extract after scanning.
+1. If the CVE ID is recognized, note the scanner's ID, affected packages, and fixed versions.
+2. If the CVE ID is **not** recognized, do **not** stop. Log that OSV has no entry and continue to Step 3 — the scanner may still detect the vulnerability directly.
 
 Do not look up CVE details from any other source during this step.
 
 ### If using govulncheck
 
-To validate, HTTP GET `https://api.osv.dev/v1/vulns/<CVE-ID>`. A successful response confirms the CVE is tracked and returns the Go vulnerability ID (alias) and affected packages/versions.
+HTTP GET `https://api.osv.dev/v1/vulns/<CVE-ID>`. A successful response returns the Go vulnerability ID (alias) and affected packages/versions. A 404 means the CVE is not in OSV — continue anyway.
 
 ## 3. Scan for the CVE
 
-Scan the cloned repo for vulnerabilities and process the output with a simple filter to match the CVE ID or its aliases. The scanner should be configured to output all details to match on the CVE ID or its aliases. Also save the full output to a local file.
-If there is no match, the repo is not affected. Report findings and stop.
+Scan the cloned repo for vulnerabilities. Use two-pass detection:
+
+**Pass 1 (precise):** Filter the output to match the CVE ID or its aliases from Step 2. The scanner should be configured to output all details. Also save the full output to a local file.
+
+**Pass 2 (fallback):** If Pass 1 finds no match, extract the Go package name from the user's input or context (e.g. `golang.org/x/net` from "Infinite parsing loop in golang.org/x/net") and check if the scanner found **any** vulnerability affecting that package.
+
+If neither pass finds a match, the repo is not affected. Report findings and stop.
 
 ### If using govulncheck
 
-Use JSON output (-json) since it contains both CVE ID and its aliases.
+Use JSON output (-json) since it contains both CVE ID and its aliases for precise matching.
 
 ## 4. Report findings
 
@@ -82,8 +86,8 @@ Report the PR URL to the user.
 ## Errors
 
 - Vulnerability scanner not found -> install it
-- CVE not in vulnerability database -> report invalid/unsupported CVE, stop
-- CVE not found in scan results -> NOT AFFECTED, stop
+- CVE not in vulnerability database -> continue, rely on scanner (Step 3)
+- CVE not found in scan results (both passes) -> NOT AFFECTED, stop
 - Dependency bump fails -> report error, ask user
 - Tests fail -> report, do NOT create PR, ask user
 - PR tool not authenticated -> ask user to authenticate
