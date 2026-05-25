@@ -543,11 +543,27 @@ class DetailedAnalysis:
     other_vulns: list = field(default_factory=list)
 
 
-def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | None) -> dict:
+def _extract_package_from_summary(summary: str) -> str:
+    """Try to extract a Go package path from a Jira ticket summary.
+
+    Looks for patterns like golang.org/x/net, github.com/foo/bar, etc.
+    """
+    match = re.search(r"((?:golang\.org|github\.com|google\.golang\.org|go\.etcd\.io)/\S+)", summary)
+    if match:
+        pkg = match.group(1).rstrip(".,;:)")
+        return pkg
+    return ""
+
+
+def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | None,
+                            fallback_package: str = "") -> dict:
     """Parse govulncheck JSON output and classify risk for the target CVE.
 
-    Returns dict with keys: risk_level, package, current_version, fixed_version,
-    other_vulns, matched_vuln_summary.
+    First tries precise matching by CVE ID and aliases. If nothing matches and
+    fallback_package is set, checks if any finding affects that package.
+
+    Returns dict with keys: risk_level, package, fixed_version,
+    other_vulns, matched_vuln_summary, matched_by_fallback.
     """
     target_ids = {cve_id.upper()}
     if osv_data:
@@ -561,6 +577,7 @@ def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | No
         "fixed_version": "",
         "other_vulns": [],
         "matched_vuln_summary": "",
+        "matched_by_fallback": False,
     }
 
     osv_entries: dict[str, dict] = {}
@@ -581,6 +598,8 @@ def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | No
         elif "finding" in obj:
             findings.append(obj["finding"])
 
+    # Collect per-finding data for both precise and fallback matching
+    parsed_findings: list[dict] = []
     for finding in findings:
         osv_id = finding.get("osv", "")
         trace = finding.get("trace", [])
@@ -589,7 +608,6 @@ def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | No
         aliases = [a.upper() for a in entry.get("aliases", [])]
         all_ids = {osv_id.upper()} | set(aliases)
 
-        is_target = bool(all_ids & target_ids)
         has_symbol_trace = any(t.get("function") for t in trace)
 
         vuln_module = ""
@@ -598,34 +616,82 @@ def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | No
                 vuln_module = t["module"]
                 break
 
-        if is_target:
-            result["package"] = vuln_module
-            result["risk_level"] = "HIGH" if has_symbol_trace else "LOW"
+        parsed_findings.append({
+            "osv_id": osv_id,
+            "entry": entry,
+            "all_ids": all_ids,
+            "has_symbol_trace": has_symbol_trace,
+            "vuln_module": vuln_module,
+            "is_target": bool(all_ids & target_ids),
+        })
 
-            for affected in entry.get("affected", []):
+    # Pass 1: precise match by CVE ID / aliases
+    for pf in parsed_findings:
+        if pf["is_target"]:
+            result["package"] = pf["vuln_module"]
+            result["risk_level"] = "HIGH" if pf["has_symbol_trace"] else "LOW"
+
+            for affected in pf["entry"].get("affected", []):
                 pkg = affected.get("package", {})
-                if pkg.get("name", "") == vuln_module or not vuln_module:
+                if pkg.get("name", "") == pf["vuln_module"] or not pf["vuln_module"]:
                     for rng in affected.get("ranges", []):
                         for event in rng.get("events", []):
                             if "fixed" in event:
                                 v = event["fixed"]
                                 result["fixed_version"] = v if v.startswith("v") else f"v{v}"
 
-            cve_ids = [a for a in entry.get("aliases", []) if a.startswith("CVE-")]
+            cve_ids = [a for a in pf["entry"].get("aliases", []) if a.startswith("CVE-")]
             result["matched_vuln_summary"] = (
-                f"{osv_id} ({', '.join(cve_ids)}): "
-                f"{'Symbol-level call found' if has_symbol_trace else 'Package imported but not called'}"
+                f"{pf['osv_id']} ({', '.join(cve_ids)}): "
+                f"{'Symbol-level call found' if pf['has_symbol_trace'] else 'Package imported but not called'}"
             )
         else:
-            cve_ids = [a for a in entry.get("aliases", []) if a.startswith("CVE-")]
-            vuln_info = {"id": osv_id, "package": vuln_module, "cve_ids": cve_ids}
+            cve_ids = [a for a in pf["entry"].get("aliases", []) if a.startswith("CVE-")]
+            vuln_info = {"id": pf["osv_id"], "package": pf["vuln_module"], "cve_ids": cve_ids}
             if vuln_info not in result["other_vulns"]:
                 result["other_vulns"].append(vuln_info)
+
+    # Pass 2: fallback — if no precise match, check if any finding affects the
+    # package mentioned in the ticket summary
+    if result["risk_level"] == "NOT_AFFECTED" and fallback_package:
+        best_fallback = None
+        for pf in parsed_findings:
+            if not pf["vuln_module"]:
+                continue
+            if (fallback_package == pf["vuln_module"]
+                    or fallback_package.startswith(pf["vuln_module"] + "/")
+                    or pf["vuln_module"].startswith(fallback_package + "/")):
+                if best_fallback is None or (pf["has_symbol_trace"] and not best_fallback["has_symbol_trace"]):
+                    best_fallback = pf
+
+        if best_fallback:
+            result["package"] = best_fallback["vuln_module"]
+            result["risk_level"] = "HIGH" if best_fallback["has_symbol_trace"] else "LOW"
+            result["matched_by_fallback"] = True
+
+            for affected in best_fallback["entry"].get("affected", []):
+                pkg = affected.get("package", {})
+                if pkg.get("name", "") == best_fallback["vuln_module"] or not best_fallback["vuln_module"]:
+                    for rng in affected.get("ranges", []):
+                        for event in rng.get("events", []):
+                            if "fixed" in event:
+                                v = event["fixed"]
+                                result["fixed_version"] = v if v.startswith("v") else f"v{v}"
+
+            cve_ids = [a for a in best_fallback["entry"].get("aliases", []) if a.startswith("CVE-")]
+            result["matched_vuln_summary"] = (
+                f"FALLBACK MATCH: {best_fallback['osv_id']} ({', '.join(cve_ids)}) "
+                f"affects {best_fallback['vuln_module']}: "
+                f"{'Symbol-level call found' if best_fallback['has_symbol_trace'] else 'Package imported but not called'}"
+            )
+            log.info("Fallback match: %s has vulnerability %s in package %s",
+                     fallback_package, best_fallback["osv_id"], best_fallback["vuln_module"])
 
     return result
 
 
-def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None) -> tuple[str, str, str, str]:
+def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
+                 summary: str = "") -> tuple[str, str, str, str]:
     """Run govulncheck in JSON mode and check if the repo is affected.
 
     Returns (risk_level, current_version, details_json, fix_type).
@@ -685,7 +751,8 @@ def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None) -> tuple[
     details.govulncheck_output = raw_output[:3000]
     log.info("govulncheck JSON output length: %d chars", len(raw_output))
 
-    parsed = _parse_govulncheck_json(raw_output, cve_id, osv_data)
+    fallback_pkg = _extract_package_from_summary(summary) if summary else ""
+    parsed = _parse_govulncheck_json(raw_output, cve_id, osv_data, fallback_pkg)
 
     details.risk_level = parsed["risk_level"]
     details.other_vulns = parsed["other_vulns"]
@@ -998,7 +1065,7 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
                 log.warning(result.error)
                 return result
 
-        risk, current_ver, govulncheck_out, fix_type = analyze_repo(tmpdir, ticket.cve_id, osv_data)
+        risk, current_ver, govulncheck_out, fix_type = analyze_repo(tmpdir, ticket.cve_id, osv_data, ticket.summary)
         result.risk_level = risk
         result.current_version = current_ver
         result.govulncheck_output = govulncheck_out
