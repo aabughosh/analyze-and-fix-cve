@@ -1102,14 +1102,15 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             return result
 
         if fix_type == "STDLIB":
-            result.error = "STDLIB vulnerability — requires Go toolchain update, cannot auto-fix"
+            result.error = "STDLIB vulnerability — requires Go version upgrade, cannot auto-fix"
             log.warning(result.error)
             comment = (
                 f"CVE Bot Analysis for {ticket.cve_id}:\n"
                 f"Risk: {risk}\n"
                 f"Package: {package}\n\n"
-                f"This is a standard library (STDLIB) vulnerability that requires a Go toolchain update.\n"
-                f"Cannot auto-fix — please coordinate with the openshift-golang-builder-container team."
+                f"This is a standard library (STDLIB) vulnerability. The affected package is part of "
+                f"the Go standard library and cannot be fixed by bumping a dependency.\n"
+                f"The fix requires upgrading the Go version in go.mod and rebuilding with a newer Go release."
             )
             _jira_add_comment(ticket.key, comment)
             _jira_add_label(ticket.key, "cve-bot-processed")

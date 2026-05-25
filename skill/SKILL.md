@@ -65,7 +65,7 @@ Summarize the full scanning file. First show the CVE that was matched. Then as e
 
 Classify the package:
 
-- No domain (`crypto/tls`, `net/http`) -> **STDLIB**: requires Go toolchain update, cannot auto-fix. Tell user to coordinate with `openshift-golang-builder-container` team. Stop.
+- No domain (`crypto/tls`, `net/http`) -> **STDLIB**: requires upgrading the Go version, cannot auto-fix by bumping a dependency. Tell the user this is a stdlib vulnerability and the fix is to upgrade Go in go.mod. Stop.
 - `golang.org/x/*` -> **EXTENDED_STDLIB**: fixable
 - Other domain -> **THIRD_PARTY**: fixable
 
@@ -92,4 +92,4 @@ Report the PR URL to the user.
 - Tests fail -> report, do NOT create PR, ask user
 - PR tool not authenticated -> ask user to authenticate
 - No fixed version available -> report, stop
-- STDLIB vulnerability -> report Go toolchain update needed, stop
+- STDLIB vulnerability -> report that a Go version upgrade is needed, stop

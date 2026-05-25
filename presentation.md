@@ -105,19 +105,19 @@ You give it a CVE → it gives you a PR
 |------|----------|---------------------|
 | **THIRD_PARTY** | `github.com/go-jose/go-jose/v4` | Yes — bumps the dependency |
 | **EXTENDED_STDLIB** | `golang.org/x/net`, `golang.org/x/crypto` | Yes — bumps the dependency |
-| **STDLIB** | `crypto/tls`, `net/http` | No — needs a Go toolchain update |
+| **STDLIB** | `crypto/tls`, `net/http` | No — requires upgrading Go itself |
 
 **When it CAN fix (THIRD_PARTY / EXTENDED_STDLIB):**
 - Looks up the fixed version, runs `go get package@fixed-version`, `go mod tidy`, tests, and creates a PR
 
-**When it CAN'T fix (STDLIB):**
-- Packages like `crypto/tls` or `net/http` are built into the Go compiler itself
-- You can't bump them in go.mod — the fix requires updating the Go toolchain version
-- That's managed by a different team (`openshift-golang-builder-container`)
-- The tool **posts a Jira comment** explaining this: risk level, which stdlib package is affected, and that a Go toolchain update is needed
-- It labels the ticket so it's not forgotten — the right team can pick it up
+**When it CAN'T auto-fix (STDLIB):**
+- Packages like `crypto/tls` or `net/http` are part of the Go standard library — they're compiled into the Go binary
+- You can't bump them with `go get` — the fix requires upgrading the Go version (e.g. `go 1.21.0` → `go 1.21.6` in go.mod)
+- The tool doesn't do this automatically because a Go version upgrade can have broader impacts (new behavior, breaking changes)
+- Instead, the tool **posts a Jira comment** with: risk level, which stdlib package is affected, and that a Go version upgrade is needed
+- The repo owner can then decide when and how to upgrade
 
-> Speaker notes: This distinction matters because a significant chunk of Go CVEs are in the standard library. When we see a stdlib vulnerability like crypto/tls or net/http, there's nothing we can do in our repo — the fix has to come from the team that builds the Go toolchain image. Without the tool, these often get silently skipped or sit for weeks because nobody knows what to do with them. Now the tool recognizes it automatically, reports the details to Jira, and makes it visible.
+> Speaker notes: This distinction matters because a significant chunk of Go CVEs are in the standard library. When we see a stdlib vulnerability like crypto/tls or net/http, you can't just bump a dependency — you need to upgrade Go itself. That's a bigger change than bumping one package, so the tool doesn't do it automatically. But it still does the full analysis, tells you exactly what's affected, and posts it to Jira so it's not forgotten. Without the tool, stdlib CVEs often sit for weeks because people try to fix them like regular dependencies and can't figure out why it's not working.
 
 ---
 
@@ -163,13 +163,13 @@ Example: CVE in `crypto/tls` (part of Go's standard library)
 4. Instead, the tool posts a Jira comment:
    - Risk level: HIGH
    - Package: `crypto/tls`
-   - "This is a standard library vulnerability that requires a Go toolchain update"
-   - "Please coordinate with the `openshift-golang-builder-container` team"
+   - "This is a standard library vulnerability — requires upgrading the Go version"
+   - "Cannot be fixed by bumping a dependency"
 5. Labels the ticket `cve-bot-processed`
 
-**The tool doesn't silently skip it — it makes the problem visible and tells you who can fix it.**
+**The tool doesn't silently skip it — it does the analysis, explains the problem, and makes it visible so the repo owner can act on it.**
 
-> Speaker notes: This is an important case because without the tool, stdlib CVEs often just sit there. Nobody knows what to do with them, or they get triaged like a regular dependency bump and someone wastes time trying to fix it before realizing it's a toolchain issue. The tool catches this immediately, posts a clear explanation to Jira, and points to the right team. That way nothing falls through the cracks.
+> Speaker notes: This is an important case because without the tool, stdlib CVEs often just sit there. People try to fix them like a regular dependency bump, can't find the package in go.mod, and give up. Or they don't realize the CVE is in the standard library at all. The tool catches this immediately — it tells you it's a stdlib issue, which package is affected, and that the fix is to upgrade Go. The repo owner can then plan the Go upgrade knowing exactly which CVEs it will resolve.
 
 ---
 
@@ -200,7 +200,7 @@ For NOT AFFECTED repos:
 - **Tests must pass** — if `go test` fails after the fix, the bot stops. No PR is created.
 - **Duplicate detection** — checks if a PR already exists before creating a new one
 - **Ticket tracking** — labels each ticket `cve-bot-processed` so it's never processed twice
-- **Standard library handling** — if the vulnerability is in Go's stdlib (like `crypto/tls`), the bot can't fix it (needs a Go toolchain update). It reports this to Jira instead of silently skipping.
+- **Standard library handling** — if the vulnerability is in Go's stdlib (like `crypto/tls`), the bot can't bump a dependency. It reports to Jira that a Go version upgrade is needed instead of silently skipping.
 
 > Speaker notes: All of these were lessons from running an earlier version. The original didn't check for duplicates, didn't label tickets, and silently skipped stdlib vulns. Now every edge case is handled explicitly.
 

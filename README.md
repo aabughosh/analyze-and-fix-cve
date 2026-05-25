@@ -128,7 +128,7 @@ This ensures that even CVEs that aren't indexed yet are caught if the package it
 |------|-----------------|---------------|
 | **THIRD_PARTY** | `github.com/go-jose/go-jose/v4` | Yes — bumps the dependency |
 | **EXTENDED_STDLIB** | `golang.org/x/net`, `golang.org/x/crypto` | Yes — bumps the dependency |
-| **STDLIB** | `crypto/tls`, `net/http` | No — these are part of the Go standard library. Fixing them requires updating the Go toolchain itself, which is managed by a different team (`openshift-golang-builder-container`). The bot reports this to Jira and stops. |
+| **STDLIB** | `crypto/tls`, `net/http` | No — these are part of the Go standard library. Fixing them requires upgrading the Go version in go.mod, not bumping a dependency. The bot reports this to Jira and stops. |
 
 ## Quick start
 
@@ -226,7 +226,7 @@ python bot.py
 
 For **NOT AFFECTED** tickets: posts a Jira comment with evidence (govulncheck output, go.mod analysis) and labels the ticket. No PR created.
 
-For **STDLIB** vulnerabilities: posts a Jira comment explaining that a Go toolchain update is needed from the `openshift-golang-builder-container` team. No PR created.
+For **STDLIB** vulnerabilities: posts a Jira comment explaining that the vulnerability is in the Go standard library and requires a Go version upgrade. No PR created.
 
 ## Prerequisites
 
