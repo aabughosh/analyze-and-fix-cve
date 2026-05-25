@@ -954,20 +954,14 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
 
     osv_data = osv_lookup_cve(ticket.cve_id)
     if osv_data is None:
-        result.error = f"{ticket.cve_id} is not tracked in the Go vulnerability database"
-        log.warning(result.error)
-        _jira_add_comment(ticket.key, f"CVE Bot: {result.error}. No action taken.")
-        _jira_add_label(ticket.key, "cve-bot-processed")
-        return result
-    if not osv_data.packages:
-        result.error = f"{ticket.cve_id} has no Go packages listed in OSV — may not be a Go vulnerability"
-        log.warning(result.error)
-        _jira_add_comment(ticket.key, f"CVE Bot: {result.error}. No action taken.")
-        _jira_add_label(ticket.key, "cve-bot-processed")
-        return result
-    log.info("OSV pre-validation: %s → %s, packages: %s",
-             ticket.cve_id, osv_data.go_vuln_id,
-             [p["name"] for p in osv_data.packages])
+        log.info("OSV has no entry for %s — will rely on govulncheck to detect it", ticket.cve_id)
+    elif not osv_data.packages:
+        log.info("OSV has no Go packages for %s — will rely on govulncheck", ticket.cve_id)
+        osv_data = None
+    else:
+        log.info("OSV pre-validation: %s → %s, packages: %s",
+                 ticket.cve_id, osv_data.go_vuln_id,
+                 [p["name"] for p in osv_data.packages])
 
     repo_url, branch = map_component_to_repo(ticket.component, ticket.version, ticket.labels)
     if not repo_url:
@@ -1016,7 +1010,7 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             package = details_dict.get("package", "")
         except (json.JSONDecodeError, TypeError):
             pass
-        if not package and osv_data.packages:
+        if not package and osv_data and osv_data.packages:
             package = osv_data.packages[0]["name"]
         result.package = package
         log.info("Risk: %s, Fix type: %s, Package: %s, Current: %s", risk, fix_type, package, current_ver)
