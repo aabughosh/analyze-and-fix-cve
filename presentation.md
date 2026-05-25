@@ -97,7 +97,24 @@ You give it a CVE → it gives you a PR
 
 ---
 
-## Slide 6: What Happens When It Finds a Vulnerability
+## Slide 6: Three Types of Vulnerabilities
+
+**Not all fixes are the same**
+
+| Type | Examples | Can the tool fix it? |
+|------|----------|---------------------|
+| **THIRD_PARTY** | `github.com/go-jose/go-jose/v4` | Yes — bumps the dependency |
+| **EXTENDED_STDLIB** | `golang.org/x/net`, `golang.org/x/crypto` | Yes — bumps the dependency |
+| **STDLIB** | `crypto/tls`, `net/http` | No — needs a Go toolchain update |
+
+- **THIRD_PARTY** and **EXTENDED_STDLIB**: the tool runs `go get package@fixed-version`, `go mod tidy`, tests, and creates a PR
+- **STDLIB**: these packages are built into Go itself. Fixing them means updating the Go compiler version, which is managed by the `openshift-golang-builder-container` team. The tool **cannot auto-fix this** — instead it posts a Jira comment explaining what's needed and stops.
+
+> Speaker notes: This distinction matters because about 30-40% of Go CVEs are in the standard library. When we see a stdlib vulnerability like crypto/tls or net/http, there's nothing we can do in our repo — the fix has to come from the team that builds the Go toolchain image. The tool recognizes this automatically and reports it to Jira so the right team gets notified, instead of silently skipping it.
+
+---
+
+## Slide 7: What Happens When It Finds a Vulnerability
 
 **Example: golang.org/x/net in cve-bot-test repo**
 
@@ -116,7 +133,7 @@ You give it a CVE → it gives you a PR
 
 ---
 
-## Slide 7: What It Posts to Jira
+## Slide 8: What It Posts to Jira
 
 **Every ticket gets a detailed comment**
 
@@ -136,7 +153,7 @@ For NOT AFFECTED repos:
 
 ---
 
-## Slide 8: Safety — What Prevents Bad PRs
+## Slide 9: Safety — What Prevents Bad PRs
 
 **Built-in guardrails**
 
@@ -149,7 +166,7 @@ For NOT AFFECTED repos:
 
 ---
 
-## Slide 9: Setup — What You Need
+## Slide 10: Setup — What You Need
 
 **Bot mode (3 secrets + 2 variables)**
 
@@ -174,7 +191,7 @@ Check if this repo is affected by CVE-2026-34986
 
 ---
 
-## Slide 10: Results
+## Slide 11: Results
 
 **What this saves**
 
@@ -192,7 +209,7 @@ Check if this repo is affected by CVE-2026-34986
 
 ---
 
-## Slide 11: Demo / Try It
+## Slide 12: Demo / Try It
 
 **Try it yourself**
 
