@@ -8,10 +8,12 @@ an **AI skill** for Cursor/Claude Code (interactive use).
 
 Given a CVE and a Go repository, it performs the full analysis and fix pipeline:
 
-1. **Validate the CVE** — calls the OSV API to confirm the CVE is tracked in the Go vulnerability database and retrieves the affected package, aliases, and fixed version upfront
+1. **Pre-validate via OSV (optional)** — calls the OSV API to get the affected package, aliases, and fixed version. If the CVE isn't in OSV, the bot continues anyway and relies on govulncheck
 2. **Find CVE tickets** (bot mode) — queries Jira for new unresolved CVE tickets assigned to your team
 3. **Find the repo** — maps the Jira component to a GitHub repository automatically (via ocp-build-data, ticket summary, or pscomponent label)
-4. **Run `govulncheck -json`** — symbol-level analysis in JSON mode, matching the specific CVE by its OSV aliases to determine if your code **actually calls** the vulnerable functions
+4. **Run `govulncheck -json`** — symbol-level analysis in JSON mode with two-pass detection:
+   - **Pass 1 (precise):** matches the specific CVE by its OSV aliases
+   - **Pass 2 (fallback):** if no precise match, extracts the package name from the ticket summary (e.g. `golang.org/x/net`) and checks if govulncheck found any vulnerability in that package
 5. **Classify the risk:**
    - **HIGH** — code calls vulnerable functions → fix immediately
    - **LOW** — dependency exists but vulnerable functions are not called → fix as best practice
@@ -79,7 +81,7 @@ Is ptp-operator vulnerable to CVE-2026-34986?
 CVE-2026-4441
      │
      ▼
-Validate via OSV API → confirms CVE exists, gets package + aliases + fixed version
+OSV API lookup (optional) → gets package + aliases + fixed version if available
      │
      ▼
 Find repo → ocp-build-data / ticket summary / pscomponent label
@@ -88,10 +90,16 @@ Find repo → ocp-build-data / ticket summary / pscomponent label
 Clone repo → fallback to main if release branch does not exist
      │
      ▼
-Run govulncheck -json → match target CVE by aliases → HIGH RISK (symbol call found)
+Run govulncheck -json
+     │
+     ├─ Pass 1: match target CVE by ID/aliases → found? → use it
+     │
+     └─ Pass 2: no match? extract package from ticket summary
+        (e.g. "golang.org/x/net") → check if govulncheck found
+        any vuln in that package → found? → use it (fallback)
      │
      ▼
-Categorize → EXTENDED_STDLIB → can auto-fix
+Classify risk → HIGH / LOW / NOT AFFECTED
      │
      ▼
 Apply fix → go get golang.org/x/net@v0.45.0 && go mod tidy
@@ -128,9 +136,9 @@ The bot runs as a GitHub Action on a schedule (every weekday at 8am UTC).
 No human intervention needed. It handles everything end-to-end:
 
 1. **Fetch new tickets** — queries Jira for unresolved CVE tickets assigned to your team's components (skips tickets already labeled `cve-bot-processed`)
-2. **Pre-validate via OSV** — calls `api.osv.dev` to confirm the CVE is tracked, get the affected Go package, fixed version, and vulnerability aliases. Skips early if the CVE is not in the database
+2. **Pre-validate via OSV (optional)** — calls `api.osv.dev` to get the affected Go package, fixed version, and vulnerability aliases. If the CVE isn't in OSV (e.g. newly assigned or internal CVE IDs), the bot continues anyway
 3. **Find the repo** — maps the Jira ticket to a GitHub repository using ocp-build-data (cached per OCP version), the ticket summary (`org/repo`), or the pscomponent label
-4. **Clone and analyze** — clones the repo, runs `govulncheck -json ./...` and matches findings to the target CVE by its aliases for accurate per-CVE risk classification
+4. **Clone and analyze** — clones the repo, runs `govulncheck -json ./...` with two-pass detection: first tries precise matching by CVE aliases, then falls back to matching the package name from the ticket summary against govulncheck findings
 5. **Classify risk** — HIGH (code calls vulnerable functions), LOW (dependency present but not called), or NOT AFFECTED
 6. **Apply fix** — bumps the dependency (`go get package@fixed-version && go mod tidy`)
 7. **Run tests** — runs `go test ./...` to verify the fix does not break anything. **If tests fail, the bot stops and does not create a PR**
