@@ -133,14 +133,21 @@ You give it a CVE → it gives you a PR
 6. Creates PR, comments on Jira
 
 **Where does the fixed version come from?** The tool checks multiple sources in order:
-1. OSV database (has the exact fix version per package)
-2. govulncheck output (includes `fixed_version` in JSON findings)
-3. vuln.go.dev (Go's official vulnerability page)
-4. proxy.golang.org (latest version as a last resort)
+
+| # | Source | What it returns | Example (GO-2024-3333) |
+|---|--------|----------------|----------------------|
+| 1 | **OSV database** (`api.osv.dev`) | Exact fix version per package | Aliases: `GO-2024-3333` |
+| 2 | **govulncheck output** | `fixed_version` field in JSON findings | `"fixed_version": "v0.33.0"` |
+| 3 | **vuln.go.dev** | Official Go vulnerability page | Fixed: `0.33.0` for `golang.org/x/net` |
+| 4 | **proxy.golang.org** | Latest version (last resort) | `v0.55.0` (latest, not minimum fix) |
+
+Sources 2 and 3 give you **v0.33.0** — the minimum version that fixes the vulnerability.
+Source 4 gives you **v0.55.0** — the latest release, which also fixes it but bumps much further than needed.
+The tool tries the precise sources first and only falls back to proxy.golang.org as a last resort.
 
 **Before:** 45 minutes. **After:** 3 minutes, no human involved.
 
-> Speaker notes: This is a real example from our test repo. The tool found that main.go directly calls the vulnerable Parse function in golang.org/x/net/html, classified it as HIGH, and fixed it end to end. For the fix version, it tries the most precise source first — OSV gives you the exact minimum fix version. If that's not available, it falls back to govulncheck's own data, then vuln.go.dev, and as a last resort it grabs the latest version from the Go module proxy.
+> Speaker notes: This is a real example from our test repo. The tool found that main.go directly calls the vulnerable Parse function in golang.org/x/net/html, classified it as HIGH, and fixed it end to end. The fixed version lookup is important to understand — the tool prefers the most precise source. govulncheck's JSON output now includes a fixed_version field directly in each finding, so in most cases the answer is right there in the scan results. vuln.go.dev is the backup. proxy.golang.org is the last resort — it gives you the latest version which always includes the fix, but might bump you further than necessary. In this example, the minimum fix is v0.33.0 but the latest version is v0.55.0.
 
 ---
 
