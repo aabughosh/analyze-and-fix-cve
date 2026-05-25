@@ -583,13 +583,19 @@ def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | No
     osv_entries: dict[str, dict] = {}
     findings: list[dict] = []
 
-    for line in raw_output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    decoder = json.JSONDecoder()
+    pos = 0
+    length = len(raw_output)
+    while pos < length:
+        while pos < length and raw_output[pos] in " \t\n\r":
+            pos += 1
+        if pos >= length:
+            break
         try:
-            obj = json.loads(line)
+            obj, end_pos = decoder.raw_decode(raw_output, pos)
+            pos = end_pos
         except json.JSONDecodeError:
+            pos += 1
             continue
 
         if "osv" in obj:
@@ -752,6 +758,8 @@ def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
     log.info("govulncheck JSON output length: %d chars", len(raw_output))
 
     fallback_pkg = _extract_package_from_summary(summary) if summary else ""
+    if fallback_pkg:
+        log.info("Fallback package from summary: %s", fallback_pkg)
     parsed = _parse_govulncheck_json(raw_output, cve_id, osv_data, fallback_pkg)
 
     details.risk_level = parsed["risk_level"]
