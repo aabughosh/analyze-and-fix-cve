@@ -61,8 +61,8 @@ Amal Abu Ghosh
 Jira ticket (OCPBUGS-XXXXX)
        |
        v
-OSV API pre-validation  -->  CVE not in Go DB? STOP
-       |
+OSV API lookup (optional) --> get package + aliases + fixed version
+       |                       if not found, continue anyway
        v
 Find repo (ocp-build-data / summary / pscomponent)
        |
@@ -70,7 +70,13 @@ Find repo (ocp-build-data / summary / pscomponent)
 Clone repo  -->  fallback to main if branch missing
        |
        v
-govulncheck -json ./...  -->  match target CVE by aliases
+govulncheck -json ./...
+       |
+       ├── Pass 1: match target CVE by ID/aliases --> found? use it
+       |
+       └── Pass 2: no match? extract package from ticket summary
+           (e.g. "golang.org/x/net") and check if govulncheck
+           found ANY vuln in that package --> found? use it
        |
        v
 Classify: HIGH / LOW / NOT AFFECTED
@@ -88,30 +94,31 @@ Check for duplicate PRs  -->  already exists? return URL
 Create PR + comment on Jira + label cve-bot-processed
 ```
 
-> Speaker notes: This is the full pipeline. The key design principle is "fail early, fail safe." The OSV check at the top avoids cloning and scanning repos for CVEs that don't even exist in Go's database. The test gate at the bottom ensures we never create a PR with broken code. And the label at the end prevents re-processing.
+> Speaker notes: This is the full pipeline. The key design principle is "fail early, fail safe." The OSV lookup is optional — if the CVE isn't in OSV (e.g. it's brand new or an internal ID), the bot keeps going and relies on govulncheck. The two-pass detection ensures we catch vulnerabilities even when precise CVE matching fails. The test gate at the bottom ensures we never create a PR with broken code. And the label at the end prevents re-processing.
 
 ---
 
-## Slide 5: OSV Pre-Validation
+## Slide 5: OSV Pre-Validation (Optional)
 
-**Validate before you scan**
+**Enrich before you scan**
 
 - First step: `GET https://api.osv.dev/v1/vulns/<CVE-ID>`
-- Confirms the CVE is tracked in the Go vulnerability database
-- Returns:
+- **OSV** = Open Source Vulnerabilities — Google's database at [osv.dev](https://osv.dev) that aggregates known vulnerabilities across ecosystems including Go
+- If the CVE is found, OSV returns:
   - Affected **Go package name** (e.g. `golang.org/x/net`)
-  - **Fixed version** (e.g. `v0.45.0`)
-  - **Go vulnerability ID** and aliases (e.g. `GO-2026-1234`)
-- If the CVE is not found: skip immediately, comment on Jira, done
+  - **Fixed version** (e.g. `v0.33.0`)
+  - **Go vulnerability ID** and aliases (e.g. `GO-2024-3333`)
+- If the CVE is **not** found in OSV: the bot **continues anyway** and relies on govulncheck
+- This is optional enrichment, not a hard gate
 - Replaces a hardcoded keyword map we used before
 
-**Why it matters:** no wasted time cloning and scanning repos for CVEs that aren't even Go vulnerabilities
+**Why it matters:** gives the bot better context (exact package, fix version, aliases) when available, but never blocks the pipeline
 
-> Speaker notes: Before this, we had a hardcoded dictionary mapping keywords like "grpc" to package names. It only covered about 12 packages. The OSV API covers the entire Go vulnerability database and gives us the exact package, fixed version, and aliases in one call. It also lets us skip non-Go CVEs immediately — no clone, no govulncheck, no wasted CI minutes.
+> Speaker notes: Before this, we had a hardcoded dictionary mapping keywords like "grpc" to package names. It only covered about 12 packages. The OSV API covers the entire Go vulnerability database and gives us the exact package, fixed version, and aliases in one call. Importantly, if a CVE isn't in OSV — maybe it's brand new, or uses an internal ID — the bot doesn't stop. It proceeds to govulncheck which scans the repo directly. OSV is "nice to have" enrichment, not a gate.
 
 ---
 
-## Slide 6: govulncheck JSON Mode
+## Slide 6: govulncheck JSON Mode + Two-Pass Detection
 
 **Accurate per-CVE risk classification**
 
@@ -119,13 +126,15 @@ Create PR + comment on Jira + label cve-bot-processed
 - JSON output has structured entries per vulnerability:
   - `osv` entries with ID and aliases
   - `finding` entries with call traces
-- We match findings to the target CVE using its aliases from OSV
-- **Why this matters:**
+- **Two-pass detection:**
+  - **Pass 1 (precise):** match the specific CVE by its ID and all known aliases from OSV
+  - **Pass 2 (fallback):** if no precise match, extract the package name from the Jira ticket summary (e.g. `golang.org/x/net`) and check if govulncheck found ANY vulnerability in that package
+- **Why JSON mode matters:**
   - Old text mode: checked if "Symbol Results" appeared *anywhere* in output
   - If CVE-A had symbol calls but CVE-B (our target) didn't, we'd misclassify CVE-B as HIGH
   - JSON mode: we check the specific finding for our CVE
 
-> Speaker notes: This was actually a bug in the original version. The text output of govulncheck groups results into "Symbol Results" and "Package Results" sections, but it doesn't tell you which CVE is in which section without parsing the whole thing. With JSON mode, each finding is a separate object with its own OSV ID and trace data, so we can match exactly.
+> Speaker notes: This was actually a bug in the original version. The text output of govulncheck groups results into "Symbol Results" and "Package Results" sections, but it doesn't tell you which CVE is in which section without parsing the whole thing. With JSON mode, each finding is a separate object with its own OSV ID and trace data, so we can match exactly. The two-pass detection is critical for catching CVEs that aren't yet in public databases — if the ticket says "vulnerability in golang.org/x/net" and govulncheck found a known vulnerability in that package, the fallback match picks it up.
 
 ---
 
