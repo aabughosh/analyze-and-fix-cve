@@ -274,7 +274,38 @@ Check if this repo is affected by CVE-2026-34986
 
 ---
 
-## Slide 13: Demo / Try It
+## Slide 13: How Much Does It Cost to Run?
+
+**GitHub Actions pricing (Linux runner)**
+
+| | |
+|--|--|
+| Per-minute rate | **$0.006** (Linux 2-core) |
+| Public repos | **Free** (always) |
+| Free plan (private repos) | **2,000 minutes/month included** |
+| Enterprise plan | **50,000 minutes/month included** |
+
+**What the bot actually uses:**
+
+Based on real runs:
+- Processing one ticket (clone + scan + fix + test + PR): **~30 seconds**
+- A typical run with 5 tickets: **~3 minutes** (including setup)
+- Runs once per weekday: **~22 runs/month**
+
+| Scenario | Minutes/month | Cost |
+|----------|--------------|------|
+| 5 tickets/run | ~66 min | **Free** (well within free tier) |
+| 10 tickets/run | ~110 min | **Free** (well within free tier) |
+| 20 tickets/run | ~200 min | **Free** (well within free tier) |
+| 50 tickets/run (heavy) | ~500 min | **Free** or ~$3/month if over quota |
+
+**Bottom line: it's essentially free.** Even with 20 tickets per run, you'd use ~200 minutes/month out of 2,000 free minutes. That's 10% of the free quota.
+
+> Speaker notes: This is a common question. GitHub Actions is free for public repos. For private repos, every plan includes free minutes — 2,000 on the free plan, 50,000 on Enterprise. Our bot uses about 30 seconds per ticket, so even processing 20 tickets every weekday uses only 200 minutes per month — 10% of the free tier. The Linux runner costs $0.006 per minute if you go over, so even in the worst case you're looking at a few dollars per month. Compare that to 7.5 hours of engineer time per sprint.
+
+---
+
+## Slide 14: Demo / Try It
 
 **Try it yourself**
 
