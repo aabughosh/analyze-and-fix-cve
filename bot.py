@@ -47,6 +47,11 @@ TEAM_COMPONENTS = [
 ]
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
+# ProdSec field on OCPBUGS Vulnerability tickets, e.g. github.com/moby/buildkit.
+JIRA_UPSTREAM_PACKAGE_FIELD = os.environ.get(
+    "JIRA_UPSTREAM_PACKAGE_FIELD", "customfield_10632"
+)
+
 OCP_BUILD_DATA_REPO = "https://github.com/openshift-eng/ocp-build-data.git"
 
 RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/tmp/cve-bot-results"))
@@ -88,6 +93,7 @@ class CVETicket:
     version: str
     status: str
     labels: list = field(default_factory=list)
+    upstream_package: str = ""
 
 
 @dataclass
@@ -111,6 +117,222 @@ class OSVData:
     go_vuln_id: str = ""
     aliases: list = field(default_factory=list)
     packages: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Package identification
+# ---------------------------------------------------------------------------
+
+GO_MODULE_PREFIXES = (
+    "github.com/",
+    "gitlab.com/",
+    "golang.org/",
+    "google.golang.org/",
+    "go.etcd.io/",
+    "go.uber.org/",
+    "go.opentelemetry.io/",
+    "go.mongodb.org/",
+    "k8s.io/",
+    "sigs.k8s.io/",
+    "gopkg.in/",
+    "cloud.google.com/",
+    "bitbucket.org/",
+)
+
+STDLIB_PACKAGES = {
+    "archive/tar", "archive/zip", "bufio", "bytes", "compress/gzip",
+    "crypto/tls", "crypto/x509", "database/sql", "encoding/asn1",
+    "encoding/json", "encoding/pem", "html", "html/template", "io",
+    "mime/multipart", "net", "net/http", "net/url", "os", "os/exec",
+    "path", "path/filepath", "regexp", "strings", "text/template",
+}
+
+# Last-resort names seen in ProdSec summaries that are not Go import paths.
+PACKAGE_KEYWORDS = (
+    ("golang.org/x/crypto", "golang.org/x/crypto"),
+    ("golang.org/x/net", "golang.org/x/net"),
+    ("golang.org/x/text", "golang.org/x/text"),
+    ("golang.org/x/sys", "golang.org/x/sys"),
+    ("golang.org/x/oauth2", "golang.org/x/oauth2"),
+    ("go-jose", "github.com/go-jose/go-jose"),
+    ("go jose", "github.com/go-jose/go-jose"),
+    ("buildkit", "github.com/moby/buildkit"),
+    ("containerd", "github.com/containerd/containerd"),
+    ("runc", "github.com/opencontainers/runc"),
+    ("google.golang.org/grpc", "google.golang.org/grpc"),
+    ("net/http", "net/http"),
+    ("crypto/tls", "crypto/tls"),
+)
+
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _normalize_go_module(name: str) -> str:
+    """Strip URL/git noise so github.com/moby/buildkit is comparable."""
+    name = (name or "").strip().strip("\"'`")
+    name = name.removeprefix("https://").removeprefix("http://")
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name.rstrip("/")
+
+
+def _is_stdlib_package(name: str) -> bool:
+    if not name:
+        return False
+    return name in STDLIB_PACKAGES
+
+
+def _is_go_module_path(name: str) -> bool:
+    name = _normalize_go_module(name)
+    if not name or " " in name:
+        return False
+    if _is_stdlib_package(name):
+        return True
+    return any(name.startswith(prefix) for prefix in GO_MODULE_PREFIXES)
+
+
+def _version_from_event(value: str) -> str:
+    """Turn a range event into a Go module version, skipping git SHAs."""
+    value = str(value).strip()
+    if not value or _GIT_SHA_RE.fullmatch(value):
+        return ""
+    return value if value.startswith("v") else f"v{value}"
+
+
+def _fixed_version_from_ranges(ranges: list) -> str:
+    for rng in ranges or []:
+        for event in rng.get("events", []) or []:
+            if "fixed" in event:
+                version = _version_from_event(event["fixed"])
+                if version:
+                    return version
+        extracted = (rng.get("database_specific") or {}).get("extracted_events") or []
+        for event in extracted:
+            if "fixed" in event:
+                version = _version_from_event(event["fixed"])
+                if version:
+                    return version
+    return ""
+
+
+def _packages_from_osv_payload(data: dict) -> list[dict]:
+    """Collect Go module names from an OSV vulnerability document.
+
+    ProdSec CVEs are often GIT-ecosystem entries (repo URL only) rather than
+    ecosystem=Go. CVE-2026-15792 is github.com/moby/buildkit via ranges[].repo.
+    """
+    packages: list[dict] = []
+    seen: set[str] = set()
+
+    def add(name: str, fixed: str = "") -> None:
+        name = _normalize_go_module(name)
+        if not name or name in seen or not _is_go_module_path(name):
+            return
+        seen.add(name)
+        packages.append({"name": name, "fixed": fixed})
+
+    for affected in data.get("affected", []) or []:
+        pkg = affected.get("package") or {}
+        ecosystem = (pkg.get("ecosystem") or "").lower()
+        pkg_name = pkg.get("name") or ""
+        ranges = affected.get("ranges") or []
+        fixed = _fixed_version_from_ranges(ranges)
+        if ecosystem in ("go",) and pkg_name:
+            add(pkg_name, fixed)
+        elif _is_go_module_path(pkg_name):
+            add(pkg_name, fixed)
+        for rng in ranges:
+            if (rng.get("type") or "").upper() == "GIT" and rng.get("repo"):
+                add(rng["repo"], fixed or _fixed_version_from_ranges([rng]))
+    return packages
+
+
+def _jira_field_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return str(value.get("value") or value.get("name") or "").strip()
+    if isinstance(value, list):
+        parts = [_jira_field_text(item) for item in value]
+        return next((part for part in parts if part), "")
+    return str(value).strip()
+
+
+def _extract_package_from_summary(summary: str) -> str:
+    """Extract a Go import path from a Jira summary when one is present."""
+    match = re.search(
+        r"((?:golang\.org|github\.com|gitlab\.com|google\.golang\.org|"
+        r"go\.etcd\.io|go\.uber\.org|k8s\.io|sigs\.k8s\.io|gopkg\.in)/\S+)",
+        summary or "",
+    )
+    if not match:
+        return ""
+    pkg = match.group(1).rstrip(".,;:)")
+    pkg = _normalize_go_module(pkg)
+    return pkg if _is_go_module_path(pkg) else ""
+
+
+def _package_from_keywords(summary: str) -> str:
+    summary_lower = (summary or "").lower()
+    for keyword, package in PACKAGE_KEYWORDS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", summary_lower):
+            return package
+    return ""
+
+
+def resolve_vulnerable_package(ticket: CVETicket, osv_data: OSVData | None) -> str:
+    """Pick the Go module to search in go.mod / source.
+
+    Order: Jira Upstream Affected Component, OSV (Go or Git repo), summary
+    import path, then well-known product names such as BuildKit.
+    """
+    jira_pkg = _normalize_go_module(ticket.upstream_package)
+    if _is_go_module_path(jira_pkg):
+        log.info("Package from Jira Upstream Affected Component: %s", jira_pkg)
+        return jira_pkg
+
+    if osv_data:
+        for pkg in osv_data.packages:
+            name = pkg.get("name") or ""
+            if name:
+                log.info("Package from OSV: %s", name)
+                return name
+
+    summary_pkg = _extract_package_from_summary(ticket.summary)
+    if summary_pkg:
+        log.info("Package from ticket summary: %s", summary_pkg)
+        return summary_pkg
+
+    keyword_pkg = _package_from_keywords(ticket.summary)
+    if keyword_pkg:
+        log.info("Package from summary keyword: %s", keyword_pkg)
+        return keyword_pkg
+
+    log.warning("Could not determine vulnerable package for %s", ticket.cve_id)
+    return ""
+
+
+def _module_candidates(package: str) -> list[str]:
+    """Package plus parent modules, e.g. golang.org/x/crypto/ssh -> golang.org/x/crypto."""
+    package = _normalize_go_module(package)
+    if not package:
+        return []
+    parts = package.split("/")
+    candidates = [package]
+    while len(parts) > 3:
+        parts = parts[:-1]
+        parent = "/".join(parts)
+        if parent not in candidates:
+            candidates.append(parent)
+    if package.startswith("golang.org/x/") and len(package.split("/")) > 3:
+        parent = "/".join(package.split("/")[:3])
+        if parent not in candidates:
+            candidates.append(parent)
+    return candidates
+
+
+def _package_in_gomod(package: str, content: str) -> bool:
+    return any(path in content for path in _module_candidates(package))
 
 
 # ---------------------------------------------------------------------------
@@ -140,20 +362,7 @@ def osv_lookup_cve(cve_id: str) -> OSVData | None:
             result.go_vuln_id = alias
             break
 
-    for affected in data.get("affected", []):
-        pkg = affected.get("package", {})
-        if pkg.get("ecosystem") != "Go":
-            continue
-        pkg_name = pkg.get("name", "")
-        fixed_version = ""
-        for rng in affected.get("ranges", []):
-            for event in rng.get("events", []):
-                if "fixed" in event:
-                    v = event["fixed"]
-                    fixed_version = v if v.startswith("v") else f"v{v}"
-        if pkg_name:
-            result.packages.append({"name": pkg_name, "fixed": fixed_version})
-
+    result.packages = _packages_from_osv_payload(data)
     return result
 
 
@@ -164,7 +373,7 @@ def osv_lookup_cve(cve_id: str) -> OSVData | None:
 def _jira_search(jql: str, max_results: int = 50) -> list[dict]:
     resp = _session.post(
         f"{JIRA_URL}/rest/api/3/search/jql",
-        json={"jql": jql, "fields": ["summary", "components", "labels", "status"], "maxResults": max_results},
+        json={"jql": jql, "fields": ["summary", "components", "labels", "status", JIRA_UPSTREAM_PACKAGE_FIELD], "maxResults": max_results},
         auth=(JIRA_USER, JIRA_TOKEN),
         headers={"Accept": "application/json", "Content-Type": "application/json"},
         timeout=30,
@@ -190,8 +399,14 @@ def _text_to_adf(text: str) -> dict:
 def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
                              package: str, risk: str, details: dict) -> str:
     """Build a detailed Jira comment with evidence."""
-    pkg_short = package.split("/")[-1] if package else "unknown"
-    risk_emoji = {"HIGH": "⛔", "LOW": "⚠️", "NOT_AFFECTED": "✅", "NOT_GO_PROJECT": "✅"}.get(risk, "❓")
+    grep_term = details.get("grep_term") or package
+    risk_emoji = {
+        "HIGH": "⛔",
+        "LOW": "⚠️",
+        "NOT_AFFECTED": "✅",
+        "NOT_GO_PROJECT": "✅",
+        "UNKNOWN": "❓",
+    }.get(risk, "❓")
 
     lines = [
         f"{ticket.cve_id} Automated Analysis {risk_emoji}",
@@ -202,7 +417,7 @@ def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
         f"- Repository: {repo_url}",
         f"- Branch: {branch}",
         f"- Go version: {details.get('go_version', 'unknown')}",
-        f"- Vulnerable package: {package or 'N/A'}",
+        f"- Vulnerable package: {package or 'could not determine'}",
         "",
         "Evidence 1: govulncheck Symbol-Level Analysis",
     ]
@@ -220,6 +435,8 @@ def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
         lines.append(f"  ⚠️ {ticket.cve_id} DETECTED in Package Results (dependency present but not called)")
     elif risk == "HIGH":
         lines.append(f"  ⛔ {ticket.cve_id} DETECTED in Symbol Results (code CALLS vulnerable functions)")
+    elif risk == "UNKNOWN":
+        lines.append(f"  ❓ {ticket.cve_id} not classified — no package name was available to search")
 
     lines.append("")
     lines.append("Evidence 2: Dependency Analysis (go.mod/go.sum)")
@@ -228,50 +445,57 @@ def _build_detailed_comment(ticket: CVETicket, repo_url: str, branch: str,
     grep_gosum = details.get("grep_gosum", "")
     go_mod_why = details.get("go_mod_why", "")
 
-    lines.append(f"  $ grep -i \"{pkg_short}\" go.mod")
-    lines.append(f"  {grep_gomod or '(no output)'}")
-    lines.append(f"  $ grep -i \"{pkg_short}\" go.sum")
-    lines.append(f"  {grep_gosum or '(no output)'}")
-    if go_mod_why:
-        lines.append(f"  $ go mod why {package}")
-        lines.append(f"  {go_mod_why[:200]}")
-
-    gomod_absent = "not found" in grep_gomod.lower() or not grep_gomod
-    gosum_absent = "not found" in grep_gosum.lower() or not grep_gosum
-
-    lines.append("  Findings:")
-    if gomod_absent:
-        lines.append(f"  {'✅' if risk == 'NOT_AFFECTED' else '❌'} {package or 'Package'} is NOT present in go.mod")
+    if not grep_term:
+        lines.append("  Skipped: no vulnerable package name was identified.")
+        lines.append("  Checked Jira Upstream Affected Component, OSV, and the ticket summary.")
+        gomod_absent = True
+        gosum_absent = True
+        no_source_refs = True
+        grep_source = ""
     else:
-        lines.append(f"  ⚠️ {package or 'Package'} IS present in go.mod")
-    if gosum_absent:
-        lines.append(f"  {'✅' if risk == 'NOT_AFFECTED' else '❌'} {package or 'Package'} is NOT present in go.sum")
-    else:
-        lines.append(f"  ⚠️ {package or 'Package'} IS present in go.sum")
+        lines.append(f"  $ grep -F \"{grep_term}\" go.mod")
+        lines.append(f"  {grep_gomod or '(no output)'}")
+        lines.append(f"  $ grep -F \"{grep_term}\" go.sum")
+        lines.append(f"  {grep_gosum or '(no output)'}")
+        if go_mod_why:
+            lines.append(f"  $ go mod why {package}")
+            lines.append(f"  {go_mod_why[:200]}")
 
-    lines.append("")
-    lines.append("Evidence 3: Source Code Analysis")
-    grep_source = details.get("grep_source", "")
-    lines.append(f"  $ grep -r \"{pkg_short}\" . --include=*.go -l")
-    lines.append(f"  {grep_source or '(no output - no references found)'}")
-    no_source_refs = "not found" in grep_source.lower() or grep_source.startswith("(no")
-    if no_source_refs:
+        gomod_absent = (not grep_gomod) or "not found" in grep_gomod.lower()
+        gosum_absent = (not grep_gosum) or "not found" in grep_gosum.lower()
+
         lines.append("  Findings:")
-        lines.append(f"  ✅ No import statements for {pkg_short}")
-        lines.append(f"  ✅ No code references to {pkg_short} functionality")
-    else:
-        lines.append("  Findings:")
-        lines.append(f"  ⚠️ Source code references to {pkg_short} found in the files above")
+        if gomod_absent:
+            lines.append(f"  {'✅' if risk == 'NOT_AFFECTED' else '❌'} {package} is NOT present in go.mod")
+        else:
+            lines.append(f"  ⚠️ {package} IS present in go.mod")
+        if gosum_absent:
+            lines.append(f"  {'✅' if risk == 'NOT_AFFECTED' else '❌'} {package} is NOT present in go.sum")
+        else:
+            lines.append(f"  ⚠️ {package} IS present in go.sum")
 
-    if risk == "NOT_AFFECTED":
+        lines.append("")
+        lines.append("Evidence 3: Source Code Analysis")
+        grep_source = details.get("grep_source", "")
+        lines.append(f"  $ grep -r -F \"{grep_term}\" . --include=*.go -l")
+        lines.append(f"  {grep_source or '(no output - no references found)'}")
+        no_source_refs = (not grep_source) or "not found" in grep_source.lower() or grep_source.startswith("(no")
+        lines.append("  Findings:")
+        if no_source_refs:
+            lines.append(f"  ✅ No import statements for {grep_term}")
+            lines.append(f"  ✅ No code references to {grep_term}")
+        else:
+            lines.append(f"  ⚠️ Source code references to {grep_term} found in the files above")
+
+    if risk == "NOT_AFFECTED" and grep_term:
         lines.append("")
         lines.append("Triple-Verification Consensus:")
         dep_ok = "✅" if gomod_absent else "⚠️"
         dep_word = "No" if gomod_absent else "Found"
         code_ok = "✅" if no_source_refs else "⚠️"
         code_word = "No" if no_source_refs else "Found"
-        lines.append(f"  Dependency check: {dep_ok} {dep_word} {pkg_short} in go.mod/go.sum")
-        lines.append(f"  Code analysis: {code_ok} {code_word} {pkg_short} imports or references")
+        lines.append(f"  Dependency check: {dep_ok} {dep_word} {grep_term} in go.mod/go.sum")
+        lines.append(f"  Code analysis: {code_ok} {code_word} {grep_term} imports or references")
         lines.append("  govulncheck: ✅ Package is absent or not called")
 
     lines.append("")
@@ -380,6 +604,7 @@ def fetch_new_cve_tickets() -> list[CVETicket]:
                 version=version_match.group(1) if version_match else "",
                 status=(fields.get("status") or {}).get("name", "Unknown"),
                 labels=fields.get("labels", []),
+                upstream_package=_jira_field_text(fields.get(JIRA_UPSTREAM_PACKAGE_FIELD)),
             ))
     return tickets
 
@@ -539,20 +764,9 @@ class DetailedAnalysis:
     grep_gomod: str = ""
     grep_gosum: str = ""
     grep_source: str = ""
+    grep_term: str = ""
     go_version: str = ""
     other_vulns: list = field(default_factory=list)
-
-
-def _extract_package_from_summary(summary: str) -> str:
-    """Try to extract a Go package path from a Jira ticket summary.
-
-    Looks for patterns like golang.org/x/net, github.com/foo/bar, etc.
-    """
-    match = re.search(r"((?:golang\.org|github\.com|google\.golang\.org|go\.etcd\.io)/\S+)", summary)
-    if match:
-        pkg = match.group(1).rstrip(".,;:)")
-        return pkg
-    return ""
 
 
 def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | None,
@@ -697,7 +911,7 @@ def _parse_govulncheck_json(raw_output: str, cve_id: str, osv_data: OSVData | No
 
 
 def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
-                 summary: str = "") -> tuple[str, str, str, str]:
+                 summary: str = "", known_package: str = "") -> tuple[str, str, str, str]:
     """Run govulncheck in JSON mode and check if the repo is affected.
 
     Returns (risk_level, current_version, details_json, fix_type).
@@ -708,8 +922,8 @@ def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
 
     gomod_content = gomod.read_text()
 
-    package = ""
-    if osv_data and osv_data.packages:
+    package = known_package
+    if not package and osv_data and osv_data.packages:
         for pkg_info in osv_data.packages:
             if pkg_info["name"] in gomod_content:
                 package = pkg_info["name"]
@@ -717,7 +931,7 @@ def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
         if not package:
             package = osv_data.packages[0]["name"]
 
-    details = DetailedAnalysis(package=package)
+    details = DetailedAnalysis(package=package, grep_term=package)
 
     go_ver_match = re.search(r"^go\s+([\d.]+)", gomod_content, re.MULTILINE)
     details.go_version = go_ver_match.group(1) if go_ver_match else "unknown"
@@ -726,27 +940,25 @@ def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
         version_match = re.search(rf"{re.escape(package)}\s+(v[\d.]+\S*)", gomod_content)
         details.current_version = version_match.group(1) if version_match else ""
 
-        pkg_short = package.split("/")[-1]
-
-        grep_result = _run(["grep", "-i", pkg_short, "go.mod"], cwd=repo_dir, check=False)
+        grep_result = _run(["grep", "-F", package, "go.mod"], cwd=repo_dir, check=False)
         details.grep_gomod = grep_result.stdout.strip() or "(not found)"
 
-        grep_sum = _run(["grep", "-i", pkg_short, "go.sum"], cwd=repo_dir, check=False)
+        grep_sum = _run(["grep", "-F", package, "go.sum"], cwd=repo_dir, check=False)
         details.grep_gosum = grep_sum.stdout.strip()[:200] if grep_sum.stdout.strip() else "(not found)"
 
         mod_why = _run(["go", "mod", "why", package], cwd=repo_dir, check=False)
         details.go_mod_why = mod_why.stdout.strip()[:500] or mod_why.stderr.strip()[:500]
 
-        source_grep = _run(["grep", "-r", pkg_short, ".", "--include=*.go", "-l"],
+        source_grep = _run(["grep", "-r", "-F", package, ".", "--include=*.go", "-l"],
                            cwd=repo_dir, check=False)
         if source_grep.stdout.strip():
             details.grep_source = source_grep.stdout.strip()[:500]
         else:
             details.grep_source = "(no source code references found)"
 
-    if package and package not in gomod_content:
+    if package and not _package_in_gomod(package, gomod_content):
         details.risk_level = "NOT_AFFECTED"
-        details.govulncheck_output = "Package not in dependency tree"
+        details.govulncheck_output = f"Package {package} not in dependency tree"
         _store_details(repo_dir, details)
         return "NOT_AFFECTED", "", json.dumps(_details_to_dict(details)), ""
 
@@ -757,9 +969,9 @@ def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
     details.govulncheck_output = raw_output[:3000]
     log.info("govulncheck JSON output length: %d chars", len(raw_output))
 
-    fallback_pkg = _extract_package_from_summary(summary) if summary else ""
+    fallback_pkg = package or _extract_package_from_summary(summary)
     if fallback_pkg:
-        log.info("Fallback package from summary: %s", fallback_pkg)
+        log.info("Fallback package for govulncheck match: %s", fallback_pkg)
     parsed = _parse_govulncheck_json(raw_output, cve_id, osv_data, fallback_pkg)
 
     details.risk_level = parsed["risk_level"]
@@ -774,7 +986,10 @@ def analyze_repo(repo_dir: str, cve_id: str, osv_data: OSVData | None,
 
     if not package:
         details.fix_type = "UNKNOWN"
-    elif "/" not in package:
+        if details.risk_level == "NOT_AFFECTED":
+            details.risk_level = "UNKNOWN"
+            log.warning("No package name for %s; not marking NOT_AFFECTED", cve_id)
+    elif package in STDLIB_PACKAGES or "/" not in package:
         details.fix_type = "STDLIB"
     elif package.startswith("golang.org/x/"):
         details.fix_type = "EXTENDED_STDLIB"
@@ -797,6 +1012,7 @@ def _details_to_dict(d: DetailedAnalysis) -> dict:
         "grep_gomod": d.grep_gomod,
         "grep_gosum": d.grep_gosum,
         "grep_source": d.grep_source,
+        "grep_term": d.grep_term,
         "other_vulns": d.other_vulns[:10],
     }
 
@@ -1029,14 +1245,19 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
 
     osv_data = osv_lookup_cve(ticket.cve_id)
     if osv_data is None:
-        log.info("OSV has no entry for %s — will rely on govulncheck to detect it", ticket.cve_id)
+        log.info("OSV has no entry for %s — will use Jira/summary package if present", ticket.cve_id)
     elif not osv_data.packages:
-        log.info("OSV has no Go packages for %s — will rely on govulncheck", ticket.cve_id)
-        osv_data = None
+        log.info("OSV has no Go/Git module for %s — will use Jira/summary package if present", ticket.cve_id)
     else:
         log.info("OSV pre-validation: %s → %s, packages: %s",
                  ticket.cve_id, osv_data.go_vuln_id,
                  [p["name"] for p in osv_data.packages])
+
+    known_package = resolve_vulnerable_package(ticket, osv_data)
+    if known_package:
+        log.info("Will search go.mod for package: %s", known_package)
+    else:
+        log.warning("No package identified for %s; will not grep for 'unknown'", ticket.cve_id)
 
     repo_url, branch = map_component_to_repo(ticket.component, ticket.version, ticket.labels)
     if not repo_url:
@@ -1073,7 +1294,9 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
                 log.warning(result.error)
                 return result
 
-        risk, current_ver, govulncheck_out, fix_type = analyze_repo(tmpdir, ticket.cve_id, osv_data, ticket.summary)
+        risk, current_ver, govulncheck_out, fix_type = analyze_repo(
+            tmpdir, ticket.cve_id, osv_data, ticket.summary, known_package)
+
         result.risk_level = risk
         result.current_version = current_ver
         result.govulncheck_output = govulncheck_out
@@ -1085,10 +1308,22 @@ def process_ticket(ticket: CVETicket) -> AnalysisResult:
             package = details_dict.get("package", "")
         except (json.JSONDecodeError, TypeError):
             pass
+        if not package:
+            package = known_package
         if not package and osv_data and osv_data.packages:
             package = osv_data.packages[0]["name"]
         result.package = package
         log.info("Risk: %s, Fix type: %s, Package: %s, Current: %s", risk, fix_type, package, current_ver)
+
+        if risk == "UNKNOWN":
+            log.warning("Could not classify %s without a package name", ticket.key)
+            try:
+                details = json.loads(govulncheck_out)
+            except (json.JSONDecodeError, TypeError):
+                details = {}
+            comment = _build_detailed_comment(ticket, repo_url, branch, package, risk, details)
+            _jira_add_comment(ticket.key, comment)
+            return result
 
         if risk in ("NOT_AFFECTED", "NOT_GO_PROJECT"):
             log.info("Not affected, skipping")
